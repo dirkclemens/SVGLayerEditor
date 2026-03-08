@@ -5,7 +5,8 @@ Fully vibe coded / agentic coded using GPT-5.2-Codex
 
 ## Screenshots
 
-![screenshot](./screenshot.png)
+<img width="529" height="400" alt="screenshot" src="https://github.com/user-attachments/assets/56ae8858-9bd8-4815-a56a-557420daa597" />
+
 
 ## Features
 
