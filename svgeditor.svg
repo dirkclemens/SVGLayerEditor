@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg height="650" viewBox="0 0 800 650" width="800" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <g>
+    <rect fill="none" height="550.00" rx="80.00" ry="80.00" stroke="#1c1c1c" stroke-width="20.00" width="700.00" x="50.00" y="50.00"/>
+    <g>
+      <line fill="none" stroke="#1c1c1c" stroke-width="2" x1="75.00" x2="725.00" y1="125.00" y2="125.00"/>
+      <line fill="none" stroke="#1c1c1c" stroke-width="2" x1="75.00" x2="725.00" y1="220.00" y2="220.00"/>
+      <line fill="none" stroke="#1c1c1c" stroke-width="2" x1="75.00" x2="725.00" y1="325.00" y2="325.00"/>
+      <line fill="none" stroke="#1c1c1c" stroke-width="2" x1="75.00" x2="725.00" y1="430.00" y2="430.00"/>
+      <line fill="none" stroke="#1c1c1c" stroke-width="2" x1="75.00" x2="725.00" y1="535.00" y2="535.00"/>
+      <line fill="none" stroke="#1c1c1c" stroke-width="2" x1="100.00" x2="100.00" y1="100" y2="560"/>
+      <line fill="none" stroke="#1c1c1c" stroke-width="2" x1="200.00" x2="200.00" y1="100" y2="560"/>
+      <line fill="none" stroke="#1c1c1c" stroke-width="2" x1="300.00" x2="300.00" y1="100.00" y2="560.00"/>
+      <line fill="none" stroke="#1c1c1c" stroke-width="2" x1="400.00" x2="400.00" y1="100.00" y2="560.00"/>
+      <line fill="none" stroke="#1c1c1c" stroke-width="2" x1="500.00" x2="500.00" y1="100.00" y2="560.00"/>
+      <line fill="none" stroke="#1c1c1c" stroke-width="2" x1="600.00" x2="600.00" y1="100" y2="560"/>
+      <line fill="none" stroke="#1c1c1c" stroke-width="2" x1="700.00" x2="700.00" y1="100" y2="560"/>
+    </g>
+    <g display="inline">
+      <rect fill="#0433FF" height="276.20" rx="0" ry="0" stroke="#1c1c1c" stroke-width="10" width="376.84" x="186.27" y="243.54"/>
+      <circle cx="267.34" cy="273.54" fill="#FFFB00" r="122.93" stroke="#1c1c1c" stroke-width="10"/>
+      <polygon fill="#FF0035" points="520.98 182.17 664.98 416.17 376.98 416.17" stroke="#1c1c1c" stroke-width="10"/>
+    </g>
+  </g>
+</svg>
