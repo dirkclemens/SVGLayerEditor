@@ -1,6 +1,6 @@
 # SVGLayerEditor
 
-macOS SwiftUI app for editing SVG layer hierarchies, previewing graphics, and saving changes.
+macOS SwiftUI app for editing SVG layer hierarchies, previewing graphics, and saving changes.    
 Fully vibe coded / agentic coded using GPT-5.2-Codex
 
 ## Screenshots
