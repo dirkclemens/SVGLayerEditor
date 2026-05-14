@@ -4,20 +4,28 @@
 //
 
 import SwiftUI
+import Combine
+import Foundation
 
 @main
 struct SVGLayerEditorApp: App {
     @StateObject private var viewModel = SVGLayerEditorViewModel()
+    @StateObject private var settings = AppSettings()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environmentObject(viewModel)
+                .environmentObject(settings)
                 .onAppear {
                     if !viewModel.hasDocument {
                         viewModel.createEmptyDocument()
                     }
                 }
+        }
+        Settings {
+            SettingsView()
+                .environmentObject(settings)
         }
         .commands {
             CommandGroup(replacing: .newItem) {

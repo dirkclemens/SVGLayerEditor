@@ -72,3 +72,6 @@ Fully vibe coded / agentic coded using GPT-5.2-Codex
 ## Development
 
 Open the Xcode project in `SVGLayerEditor.xcodeproj`.
+
+## TODO 
+- check if standard lib can be used better: https://github.com/swift-standards/swift-w3c-svg/blob/main/README.md

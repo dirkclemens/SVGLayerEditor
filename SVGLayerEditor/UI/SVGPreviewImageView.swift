@@ -6,18 +6,16 @@ struct SVGPreviewImageView: View {
     let paths: [SVGLayerEditorViewModel.SVGPreviewPath]
     let scale: CGFloat
     let selectedID: UUID?
+    let moveSensitivity: CGFloat
+    let resizeSensitivity: CGFloat
+    let gridSpacing: CGFloat
+    let gridColor: Color
+    let borderColor: Color
     let onSelect: (UUID?) -> Void
     let onTransform: (UUID, CGAffineTransform) -> Void
 
     private let parser = SVGPathParser()
     @State private var dragMode: DragMode?
-
-    private let moveSensitivity: CGFloat = 0.35
-    private let resizeSensitivity: CGFloat = 0.35
-
-    private let gridSpacing: CGFloat = 50
-    private let gridColor = Color.gray.opacity(0.25)
-    private let borderColor = Color.gray.opacity(0.6)
 
     var body: some View {
         GeometryReader { geo in
@@ -44,7 +42,7 @@ struct SVGPreviewImageView: View {
                            let textValue = pathElement.text,
                            let x = number(pathElement.attributes["x"]),
                            let y = number(pathElement.attributes["y"]) {
-                            let fontSize = number(pathElement.attributes["font-size"]) ?? 16
+                            let fontSize = SVGTextMetrics.resolvedFontSize(attributes: pathElement.attributes)
                             let textColor = Color(svg: pathElement.fill ?? "black") ?? .black
                             let text = Text(textValue).font(.system(size: fontSize))
                             context.draw(text.foregroundStyle(textColor), at: CGPoint(x: x, y: y), anchor: .topLeading)
@@ -192,7 +190,8 @@ struct SVGPreviewImageView: View {
             for point in list.dropFirst() { path.addLine(to: point) }
             return path
         case "text":
-            return nil
+            guard let bounds = SVGTextMetrics.bounds(attributes: item.attributes, text: item.text) else { return nil }
+            return CGPath(rect: bounds, transform: nil)
         default:
             return nil
         }

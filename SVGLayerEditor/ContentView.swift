@@ -9,6 +9,7 @@ import AppKit
 
 struct ContentView: View {
     @EnvironmentObject private var viewModel: SVGLayerEditorViewModel
+    @EnvironmentObject private var settings: AppSettings
     @State private var previewZoom: CGFloat = 1.0
     @State private var expandedNodes: Set<UUID> = []
     @State private var lastDocument: SVGDocument?
@@ -100,22 +101,36 @@ struct ContentView: View {
                 .help("Add Text")
                 .disabled(!viewModel.hasDocument)
             }
-
+        
             ToolbarItemGroup(placement: .automatic) {
                 if viewModel.selectedNodeID != nil {
                     ColorPicker("Fill", selection: Binding(
                         get: { viewModel.selectedFillColor ?? .black },
                         set: { viewModel.setFillColor($0) }
-                    ))
+                    ), supportsOpacity: true)
                     .labelsHidden()
                     .help("Fill Color")
 
                     ColorPicker("Stroke", selection: Binding(
                         get: { viewModel.selectedStrokeColor ?? .black },
                         set: { viewModel.setStrokeColor($0) }
-                    ))
+                    ), supportsOpacity: true)
                     .labelsHidden()
                     .help("Stroke Color")
+                    
+//                    NSColorWellPicker(color: Binding(
+//                        get: { NSColor(viewModel.selectedFillColor ?? .white) },
+//                        set: { viewModel.setFillColor(Color($0)) }
+//                    ))
+//                    .padding(.horizontal, 4)
+//                    .help("Fill Color")
+//                                        
+//                    NSColorWellPicker(color: Binding(
+//                        get: { NSColor(viewModel.selectedStrokeColor ?? .black) },
+//                        set: { viewModel.setStrokeColor(Color($0)) }
+//                    ))
+//                    .padding(.horizontal, 4)
+//                    .help("Stroke Color")
                 }
             }
 
@@ -147,34 +162,34 @@ struct ContentView: View {
 
                     Divider()
 
-                    Button("Align Left to Reference") {
+                    Button("Align Left to last selection") {
                         viewModel.alignSelectedToReference(.left)
                     }
                     .disabled(viewModel.selectedNodeID == nil || !viewModel.hasReferenceSelection)
 
-                    Button("Align Center X to Reference") {
+                    Button("Align Center X to last selection") {
                         viewModel.alignSelectedToReference(.centerX)
                     }
                     .disabled(viewModel.selectedNodeID == nil || !viewModel.hasReferenceSelection)
 
-                    Button("Align Right to Reference") {
+                    Button("Align Right to last selection") {
                         viewModel.alignSelectedToReference(.right)
                     }
                     .disabled(viewModel.selectedNodeID == nil || !viewModel.hasReferenceSelection)
 
                     Divider()
 
-                    Button("Align Top to Reference") {
+                    Button("Align Top to last selection") {
                         viewModel.alignSelectedToReference(.top)
                     }
                     .disabled(viewModel.selectedNodeID == nil || !viewModel.hasReferenceSelection)
 
-                    Button("Align Center Y to Reference") {
+                    Button("Align Center Y to last selection") {
                         viewModel.alignSelectedToReference(.centerY)
                     }
                     .disabled(viewModel.selectedNodeID == nil || !viewModel.hasReferenceSelection)
 
-                    Button("Align Bottom to Reference") {
+                    Button("Align Bottom to last selection") {
                         viewModel.alignSelectedToReference(.bottom)
                     }
                     .disabled(viewModel.selectedNodeID == nil || !viewModel.hasReferenceSelection)
@@ -199,10 +214,13 @@ struct ContentView: View {
                 lastDocument = nil
                 return
             }
-            if let oldDoc = lastDocument {
+            if let oldDoc = lastDocument,
+               oldDoc.sourceURL == newDoc.sourceURL {
                 let paths = expandedNodes.compactMap { viewModel.nodePath(for: $0, in: oldDoc) }
                 let newExpanded = paths.compactMap { viewModel.nodeID(for: $0, in: newDoc) }
                 expandedNodes = Set(newExpanded)
+            } else {
+                expandedNodes = allExpandedNodeIDs(in: newDoc.root)
             }
             lastDocument = newDoc
         }
@@ -254,8 +272,11 @@ struct ContentView: View {
                     }
                 }
                 HStack(alignment: .top, spacing: 12) {
-                    PlainTextEditor(text: $viewModel.documentXMLText)
-                        .frame(minHeight: 120)
+                    PlainTextEditor(
+                        text: $viewModel.documentXMLText,
+                        configuration: settings.plainTextEditorConfiguration
+                    )
+                        .frame(minHeight: 60)
 
                     if let error = viewModel.documentXMLError {
                         Text(error)
@@ -283,39 +304,49 @@ struct ContentView: View {
                     Text("Children: \(node.children.count)")
                 }
 
-                if node.elementName == "svg" {
-                    HStack(spacing: 8) {
-                        Text("Width")
-                        TextField("", text: Binding(
-                            get: { viewModel.rootAttribute("width") },
-                            set: { viewModel.setRootAttribute("width", value: $0) }
-                        ))
-                        .frame(width: 80)
-
-                        Text("Height")
-                        TextField("", text: Binding(
-                            get: { viewModel.rootAttribute("height") },
-                            set: { viewModel.setRootAttribute("height", value: $0) }
-                        ))
-                        .frame(width: 80)
-
-                        Text("ViewBox")
-                        TextField("", text: Binding(
-                            get: { viewModel.rootAttribute("viewBox") },
-                            set: { viewModel.setRootAttribute("viewBox", value: $0) }
-                        ))
-                        .frame(minWidth: 200)
-                    }
-                }
+//                if node.elementName == "svg" {
+//                    HStack(spacing: 8) {
+//                        Text("Width")
+//                        TextField("", text: Binding(
+//                            get: { viewModel.rootAttribute("width") },
+//                            set: { viewModel.setRootAttribute("width", value: $0) }
+//                        ))
+//                        .frame(width: 80)
+//
+//                        Text("Height")
+//                        TextField("", text: Binding(
+//                            get: { viewModel.rootAttribute("height") },
+//                            set: { viewModel.setRootAttribute("height", value: $0) }
+//                        ))
+//                        .frame(width: 80)
+//
+//                        Text("ViewBox")
+//                        TextField("", text: Binding(
+//                            get: { viewModel.rootAttribute("viewBox") },
+//                            set: { viewModel.setRootAttribute("viewBox", value: $0) }
+//                        ))
+//                        .frame(minWidth: 200)
+//                    }
+//                }
 
                 if let text = node.text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     Text("Text: \(text)")
                 }
                 Divider()
-                Text("Raw XML")
+                HStack {
+                    Text("Raw XML")
+                    Spacer()
+                    Button("Apply") {
+                        viewModel.applySelectedNodeXMLFromEditor()
+                    }
+                }
                 HStack(alignment: .top, spacing: 12) {
-                    PlainTextEditor(text: $viewModel.selectedNodeXMLText)
-                        .frame(minHeight: 40)
+                    PlainTextEditor(
+                        text: $viewModel.selectedNodeXMLText,
+                        configuration: settings.plainTextEditorConfiguration
+                    )
+                    .frame(height: 60)
+                    .windowResizeAnchor(.bottomTrailing)
 
                     if let error = viewModel.selectedNodeXMLError {
                         Text(error)
@@ -403,6 +434,11 @@ struct ContentView: View {
                     paths: paths,
                     scale: previewZoom,
                     selectedID: viewModel.selectedNodeID,
+                    moveSensitivity: settings.moveSensitivityValue,
+                    resizeSensitivity: settings.resizeSensitivityValue,
+                    gridSpacing: settings.gridSpacingValue,
+                    gridColor: settings.gridColor,
+                    borderColor: settings.borderColor,
                     onSelect: { viewModel.selectedNodeID = $0 },
                     onTransform: { id, transform in
                         viewModel.transformElement(nodeID: id, transform: transform)
@@ -438,17 +474,17 @@ private extension ContentView {
                 .buttonStyle(.plain)
             }
             VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
+//                HStack(spacing: 6) {
                     Text(node.displayName)
-                    if node.elementName == "svg" {
-                        Text("SVG Root")
-                            .font(.caption2)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.gray.opacity(0.15))
-                            .cornerRadius(4)
-                    }
-                }
+//                    if node.elementName == "svg" {
+//                        Text("SVG Root")
+//                            .font(.caption2)
+//                            .padding(.horizontal, 6)
+//                            .padding(.vertical, 2)
+//                            .background(Color.gray.opacity(0.15))
+//                            .cornerRadius(4)
+//                    }
+//                }
                 if let detail = pathDetail(for: node) {
                     Text(detail)
                         .font(.caption)
@@ -467,6 +503,15 @@ private extension ContentView {
         if text.count <= max { return text }
         let index = text.index(text.startIndex, offsetBy: max)
         return String(text[..<index]) + "..."
+    }
+
+    func allExpandedNodeIDs(in node: LayerNode) -> Set<UUID> {
+        var ids: Set<UUID> = []
+        for child in node.children where !child.children.isEmpty {
+            ids.insert(child.id)
+            ids.formUnion(allExpandedNodeIDs(in: child))
+        }
+        return ids
     }
 
     func dragItemProvider(for node: LayerNode) -> NSItemProvider {

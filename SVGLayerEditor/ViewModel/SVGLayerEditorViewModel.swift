@@ -46,19 +46,11 @@ final class SVGLayerEditorViewModel: ObservableObject {
     private let maxRecentCount = 10
     private var isApplyingEditorUpdate = false
     private var isApplyingDocumentUpdate = false
-    private var cancellables = Set<AnyCancellable>()
 
     private var lastReferenceNodeID: UUID?
 
     init() {
         loadRecentFiles()
-        $selectedNodeXMLText
-            .dropFirst()
-            .debounce(for: .milliseconds(200), scheduler: RunLoop.main)
-            .sink { [weak self] text in
-                self?.applySelectedNodeXMLText(text)
-            }
-            .store(in: &cancellables)
     }
 
     var hasDocument: Bool {
@@ -201,6 +193,7 @@ final class SVGLayerEditorViewModel: ObservableObject {
             parent.children[index] = newNode
             doc.isDirty = true
             document = doc
+            syncSelectedNodeText()
         }
     }
 
@@ -229,6 +222,10 @@ final class SVGLayerEditorViewModel: ObservableObject {
         applyDocumentXMLText(documentXMLText)
     }
 
+    func applySelectedNodeXMLFromEditor() {
+        applySelectedNodeXMLText(selectedNodeXMLText)
+    }
+
     func openDocument() {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.svg]
@@ -246,8 +243,8 @@ final class SVGLayerEditorViewModel: ObservableObject {
             doc.sourceURL = url
             doc.isDirty = false
             document = doc
-            selectedNodeID = nil
             lastReferenceNodeID = nil
+            selectedNodeID = doc.root.id
             resetUndoStack()
             addRecentFile(url)
         } catch {
@@ -409,8 +406,8 @@ final class SVGLayerEditorViewModel: ObservableObject {
             ]
         )
         document = SVGDocument(root: root)
-        selectedNodeID = nil
         lastReferenceNodeID = nil
+        selectedNodeID = root.id
         resetUndoStack()
     }
 
@@ -1007,11 +1004,12 @@ extension SVGLayerEditorViewModel {
             let transformed = list.map { $0.applying(transform) }
             node.attributes["points"] = serializePoints(transformed)
         case "text":
-            guard let x = number(node.attributes["x"]),
-                  let y = number(node.attributes["y"]) else { return }
-            let p = CGPoint(x: x, y: y).applying(transform)
-            node.attributes["x"] = format(p.x)
-            node.attributes["y"] = format(p.y)
+            guard let bounds = SVGTextMetrics.bounds(attributes: node.attributes, text: node.text) else { return }
+            let newBounds = transformRect(bounds, by: transform)
+            let fontSize = SVGTextMetrics.resolvedFontSize(attributes: node.attributes)
+            node.attributes["x"] = format(newBounds.origin.x)
+            node.attributes["y"] = format(newBounds.origin.y)
+            node.attributes["font-size"] = format(fontSize * SVGTextMetrics.scaleFactor(from: transform))
         default:
             return
         }
@@ -1106,9 +1104,7 @@ extension SVGLayerEditorViewModel {
             }
             return bounds
         case "text":
-            guard let x = number(node.attributes["x"]),
-                  let y = number(node.attributes["y"]) else { return nil }
-            return CGRect(x: x, y: y, width: 1, height: 1)
+            return SVGTextMetrics.bounds(attributes: node.attributes, text: node.text)
         default:
             return nil
         }
