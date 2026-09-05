@@ -12,6 +12,10 @@ struct SVGLayerEditorApp: App {
     @StateObject private var viewModel = SVGLayerEditorViewModel()
     @StateObject private var settings = AppSettings()
 
+    init() {
+        UpdateChecker.checkForUpdate()
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()
