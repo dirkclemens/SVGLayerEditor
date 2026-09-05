@@ -1,2 +1,5 @@
 images/
 *.md
+*.dmg
+*.sh
+landing.html
