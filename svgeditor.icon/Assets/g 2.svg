@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1024" height="1024" viewBox="0 -75 800 800">
+  <g>
+    <g>
+      <line x1="75.00" y1="125.00" x2="725.00" y2="125.00" fill="none" stroke="#1c1c1c" stroke-width="2"/>
+      <line x1="75.00" y1="220.00" x2="725.00" y2="220.00" fill="none" stroke="#1c1c1c" stroke-width="2"/>
+      <line x1="75.00" y1="325.00" x2="725.00" y2="325.00" fill="none" stroke="#1c1c1c" stroke-width="2"/>
+      <line x1="75.00" y1="430.00" x2="725.00" y2="430.00" fill="none" stroke="#1c1c1c" stroke-width="2"/>
+      <line x1="75.00" y1="535.00" x2="725.00" y2="535.00" fill="none" stroke="#1c1c1c" stroke-width="2"/>
+      <line x1="100.00" y1="100" x2="100.00" y2="560" fill="none" stroke="#1c1c1c" stroke-width="2"/>
+      <line x1="200.00" y1="100" x2="200.00" y2="560" fill="none" stroke="#1c1c1c" stroke-width="2"/>
+      <line x1="300.00" y1="100.00" x2="300.00" y2="560.00" fill="none" stroke="#1c1c1c" stroke-width="2"/>
+      <line x1="400.00" y1="100.00" x2="400.00" y2="560.00" fill="none" stroke="#1c1c1c" stroke-width="2"/>
+      <line x1="500.00" y1="100.00" x2="500.00" y2="560.00" fill="none" stroke="#1c1c1c" stroke-width="2"/>
+      <line x1="600.00" y1="100" x2="600.00" y2="560" fill="none" stroke="#1c1c1c" stroke-width="2"/>
+      <line x1="700.00" y1="100" x2="700.00" y2="560" fill="none" stroke="#1c1c1c" stroke-width="2"/>
+    </g>
+  </g>
+</svg>
