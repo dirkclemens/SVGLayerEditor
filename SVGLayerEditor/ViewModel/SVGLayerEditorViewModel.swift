@@ -8,6 +8,7 @@ import UniformTypeIdentifiers
 final class SVGLayerEditorViewModel: ObservableObject {
     @Published var document: SVGDocument? {
         didSet {
+            documentVersion &+= 1
             syncDocumentText()
         }
     }
@@ -20,6 +21,7 @@ final class SVGLayerEditorViewModel: ObservableObject {
         }
     }
     @Published var clipboardMode: ClipboardInsertMode = .svgContents
+    @Published var alertTitle = "Error"
     @Published var errorMessage: String?
     @Published var isShowingError = false
     @Published private(set) var recentFiles: [URL] = []
@@ -28,8 +30,11 @@ final class SVGLayerEditorViewModel: ObservableObject {
     @Published var documentXMLText: String = ""
     @Published var documentXMLError: String?
 
-    private var lastFillHex: String = "#4f8cff"
-    private var lastStrokeHex: String = "#1c1c1c"
+    /// Canvas size of new documents. 1024 × 1024 is the Icon Composer canvas.
+    nonisolated static let defaultDocumentSize: CGFloat = 1024
+
+    private var lastFillHex: String = "#4F8CFF"
+    private var lastStrokeHex: String = "#1C1C1C"
 
     private struct UndoSnapshot {
         let document: SVGDocument
@@ -38,16 +43,36 @@ final class SVGLayerEditorViewModel: ObservableObject {
 
     private var undoStack: [UndoSnapshot] = []
     private var redoStack: [UndoSnapshot] = []
-    private let maxUndoCount = 50
+    private let maxUndoCount = 100
+    /// Continuous edits (dragging, color panel) with the same key form one undo step.
+    private var undoCoalescingKey: String?
+    private var undoCoalescingDate = Date.distantPast
 
     private let clipboard = ClipboardService()
     private let serializer = SVGSerializer()
-    private let recentKey = "recentSVGFiles"
-    private let maxRecentCount = 10
     private var isApplyingEditorUpdate = false
     private var isApplyingDocumentUpdate = false
 
     private var lastReferenceNodeID: UUID?
+
+    /// Bumped on every document assignment; keys the render scene caches.
+    private var documentVersion = 0
+    private var previewSceneCache: (version: Int, scene: SVGRenderScene)?
+    private var geometrySceneCache: (version: Int, scene: SVGRenderScene)?
+
+    private struct RecentEntry {
+        let url: URL
+        let bookmark: Data?
+    }
+
+    private let recentKey = "recentSVGDocuments"
+    private let legacyRecentKey = "recentSVGFiles"
+    private let maxRecentCount = 10
+    private var recentEntries: [RecentEntry] = [] {
+        didSet { recentFiles = recentEntries.map(\.url) }
+    }
+    /// Security-scoped URL of the open document (recent files in the sandbox).
+    private var securityScopedURL: URL?
 
     init() {
         loadRecentFiles()
@@ -99,21 +124,26 @@ final class SVGLayerEditorViewModel: ObservableObject {
     }
 
     var selectedFillColor: Color? {
-        guard let doc = document, let selectedID = selectedNodeID,
-              let node = doc.root.findNode(by: selectedID),
-              let value = node.attributes["fill"] else { return nil }
-        return Color(svg: value)
+        resolvedPaintColor(fill: true)
     }
 
     var selectedStrokeColor: Color? {
-        guard let doc = document, let selectedID = selectedNodeID,
-              let node = doc.root.findNode(by: selectedID),
-              let value = node.attributes["stroke"] else { return nil }
-        return Color(svg: value)
+        resolvedPaintColor(fill: false)
     }
+
+    private func resolvedPaintColor(fill: Bool) -> Color? {
+        guard let selectedID = selectedNodeID,
+              let item = geometryScene?.items.first(where: { $0.id == selectedID }) else { return nil }
+        guard case .color(var color) = fill ? item.fill : item.stroke else { return nil }
+        color.alpha *= fill ? item.fillOpacity : item.strokeOpacity
+        return color.swiftUIColor
+    }
+
+    // MARK: Undo
 
     func undo() {
         guard let snapshot = undoStack.popLast() else { return }
+        undoCoalescingKey = nil
         if let doc = document {
             redoStack.append(UndoSnapshot(
                 document: SVGDocument(root: doc.root.deepCopy(), sourceURL: doc.sourceURL, isDirty: doc.isDirty),
@@ -129,6 +159,7 @@ final class SVGLayerEditorViewModel: ObservableObject {
 
     func redo() {
         guard let snapshot = redoStack.popLast() else { return }
+        undoCoalescingKey = nil
         if let doc = document {
             undoStack.append(UndoSnapshot(
                 document: SVGDocument(root: doc.root.deepCopy(), sourceURL: doc.sourceURL, isDirty: doc.isDirty),
@@ -142,7 +173,15 @@ final class SVGLayerEditorViewModel: ObservableObject {
         selectedNodeID = snapshot.selectedNodeID
     }
 
-    private func pushUndoSnapshot(for doc: SVGDocument) {
+    private func pushUndoSnapshot(for doc: SVGDocument, coalescingKey: String? = nil) {
+        let now = Date()
+        if let coalescingKey, coalescingKey == undoCoalescingKey, now.timeIntervalSince(undoCoalescingDate) < 2 {
+            undoCoalescingDate = now
+            return
+        }
+        undoCoalescingKey = coalescingKey
+        undoCoalescingDate = now
+
         let snapshot = UndoSnapshot(
             document: SVGDocument(root: doc.root.deepCopy(), sourceURL: doc.sourceURL, isDirty: doc.isDirty),
             selectedNodeID: selectedNodeID
@@ -154,40 +193,72 @@ final class SVGLayerEditorViewModel: ObservableObject {
         redoStack.removeAll()
     }
 
+    /// Ends a continuous edit (e.g. a drag), so the next one gets its own undo step.
+    func endInteractiveChange() {
+        undoCoalescingKey = nil
+    }
+
     private func resetUndoStack() {
         undoStack = []
         redoStack = []
+        undoCoalescingKey = nil
     }
+
+    // MARK: XML editors
 
     func applySelectedNodeXMLText(_ text: String) {
         guard !isApplyingEditorUpdate else { return }
-        guard var doc = document, let selectedID = selectedNodeID else { return }
+        guard var doc = document, let selectedID = selectedNodeID,
+              let existingNode = doc.root.findNode(by: selectedID) else { return }
+
+        if existingNode === doc.root {
+            // The root's raw XML is the whole document.
+            do {
+                let parsed = try SVGParser.parseDocument(from: text)
+                if serializer.serialize(node: parsed.root) == serializer.serialize(node: doc.root) {
+                    selectedNodeXMLError = nil
+                    return
+                }
+                pushUndoSnapshot(for: doc)
+                let newRoot = parsed.root
+                doc.root = LayerNode(
+                    id: selectedID,
+                    name: newRoot.name,
+                    elementName: newRoot.elementName,
+                    attributes: newRoot.attributes,
+                    children: newRoot.children,
+                    text: newRoot.text
+                )
+                selectedNodeXMLError = nil
+                doc.isDirty = true
+                document = doc
+                syncSelectedNodeText()
+            } catch {
+                selectedNodeXMLError = error.localizedDescription
+            }
+            return
+        }
+
         guard let parent = doc.root.findParent(of: selectedID),
               let index = parent.children.firstIndex(where: { $0.id == selectedID }) else { return }
 
-        let parseResult = parseNode(from: text)
-        switch parseResult {
+        switch parseNode(from: text) {
         case .failure(let error):
             selectedNodeXMLError = error.localizedDescription
-            return
         case .success(let parsedNode):
-            let existingNode = parent.children[index]
-            let existingXML = serializer.serialize(node: existingNode)
-            let parsedXML = serializer.serialize(node: parsedNode)
-            if existingXML == parsedXML {
+            if serializer.serialize(node: existingNode) == serializer.serialize(node: parsedNode) {
                 selectedNodeXMLError = nil
                 return
             }
 
             pushUndoSnapshot(for: doc)
-            var newNode = parsedNode
-            newNode = LayerNode(
+            let newNode = LayerNode(
                 id: selectedID,
-                name: newNode.name,
-                elementName: newNode.elementName,
-                attributes: newNode.attributes,
-                children: newNode.children,
-                text: newNode.text
+                name: parsedNode.name,
+                elementName: parsedNode.elementName,
+                attributes: parsedNode.attributes,
+                children: parsedNode.children,
+                text: parsedNode.text
             )
             selectedNodeXMLError = nil
             parent.children[index] = newNode
@@ -203,6 +274,10 @@ final class SVGLayerEditorViewModel: ObservableObject {
         let selectionPath = selectedNodeID.flatMap { nodePath(for: $0, in: currentDoc) }
         do {
             var parsed = try SVGParser.parseDocument(from: text)
+            if serializer.serialize(document: parsed) == serializer.serialize(document: currentDoc) {
+                documentXMLError = nil
+                return
+            }
             parsed.sourceURL = currentDoc.sourceURL
             parsed.isDirty = true
             pushUndoSnapshot(for: currentDoc)
@@ -226,39 +301,114 @@ final class SVGLayerEditorViewModel: ObservableObject {
         applySelectedNodeXMLText(selectedNodeXMLText)
     }
 
+    // MARK: Files
+
+    /// Asks before unsaved changes would be lost. Returns false if the user cancels.
+    func confirmDiscardChangesIfNeeded() -> Bool {
+        guard isDirty else { return true }
+        let alert = NSAlert()
+        alert.messageText = "Do you want to save the changes made to \u{201C}\(documentDisplayName)\u{201D}?"
+        alert.informativeText = "Your changes will be lost if you don't save them."
+        alert.addButton(withTitle: "Save")
+        let dontSave = alert.addButton(withTitle: "Don't Save")
+        dontSave.keyEquivalent = "d"
+        dontSave.keyEquivalentModifierMask = [.command]
+        alert.addButton(withTitle: "Cancel")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            saveDocument()
+            return !isDirty
+        case .alertSecondButtonReturn:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Window close: ask, and drop the discarded document so quitting does not ask again.
+    func confirmCloseIfNeeded() -> Bool {
+        guard confirmDiscardChangesIfNeeded() else { return false }
+        DispatchQueue.main.async { [weak self] in
+            self?.closeDocument()
+        }
+        return true
+    }
+
+    private var documentDisplayName: String {
+        document?.sourceURL?.lastPathComponent ?? "Untitled"
+    }
+
+    func newDocument(size: CGFloat = defaultDocumentSize) {
+        guard confirmDiscardChangesIfNeeded() else { return }
+        createEmptyDocument(size: size)
+    }
+
     func openDocument() {
+        guard confirmDiscardChangesIfNeeded() else { return }
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.svg]
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         if panel.runModal() == .OK, let url = panel.url {
-            openDocument(at: url)
+            loadDocument(at: url, securityScoped: false)
         }
     }
 
+    /// Opens a file (drag & drop), asking first if there are unsaved changes.
     func openDocument(at url: URL) {
+        guard confirmDiscardChangesIfNeeded() else { return }
+        loadDocument(at: url, securityScoped: false)
+    }
+
+    func openRecent(_ url: URL) {
+        guard confirmDiscardChangesIfNeeded() else { return }
+        guard let entry = recentEntries.first(where: { $0.url == url }), let bookmark = entry.bookmark else {
+            loadDocument(at: url, securityScoped: false)
+            return
+        }
+        var isStale = false
+        guard let resolved = try? URL(
+            resolvingBookmarkData: bookmark,
+            options: [.withSecurityScope, .withoutUI],
+            relativeTo: nil,
+            bookmarkDataIsStale: &isStale
+        ) else {
+            loadDocument(at: url, securityScoped: false)
+            return
+        }
+        let didStartAccess = resolved.startAccessingSecurityScopedResource()
+        loadDocument(at: resolved, securityScoped: didStartAccess)
+    }
+
+    private func loadDocument(at url: URL, securityScoped: Bool) {
         do {
             let data = try Data(contentsOf: url)
             var doc = try SVGParser.parseDocument(from: data)
             doc.sourceURL = url
             doc.isDirty = false
+            replaceSecurityScope(with: securityScoped ? url : nil)
             document = doc
             lastReferenceNodeID = nil
             selectedNodeID = doc.root.id
             resetUndoStack()
             addRecentFile(url)
         } catch {
+            if securityScoped { url.stopAccessingSecurityScopedResource() }
             presentError(error)
         }
     }
 
-    func openRecent(_ url: URL) {
-        openDocument(at: url)
+    private func replaceSecurityScope(with url: URL?) {
+        if let current = securityScopedURL, current != url {
+            current.stopAccessingSecurityScopedResource()
+        }
+        securityScopedURL = url
     }
 
     func clearRecentFiles() {
-        recentFiles = []
+        recentEntries = []
         UserDefaults.standard.removeObject(forKey: recentKey)
+        UserDefaults.standard.removeObject(forKey: legacyRecentKey)
     }
 
     func saveDocument() {
@@ -284,12 +434,6 @@ final class SVGLayerEditorViewModel: ObservableObject {
     }
 
     func saveDocumentAs() {
-        if !Thread.isMainThread {
-            DispatchQueue.main.async { [weak self] in
-                self?.saveDocumentAs()
-            }
-            return
-        }
         guard let doc = document else { return }
         do {
             try validateDocument(doc)
@@ -299,12 +443,14 @@ final class SVGLayerEditorViewModel: ObservableObject {
         }
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.svg]
+        panel.nameFieldStringValue = doc.sourceURL?.lastPathComponent ?? "Untitled.svg"
         if panel.runModal() == .OK, let url = panel.url {
             do {
                 try writeDocument(doc, to: url)
                 var updated = doc
                 updated.sourceURL = url
                 updated.isDirty = false
+                replaceSecurityScope(with: nil)
                 document = updated
                 addRecentFile(url)
             } catch {
@@ -313,32 +459,72 @@ final class SVGLayerEditorViewModel: ObservableObject {
         }
     }
 
+    /// Writes the document as an Icon Composer `.icon` bundle (one SVG per layer + icon.json).
+    func exportIconComposer() {
+        guard let doc = document else { return }
+        do {
+            try validateDocument(doc)
+            let export = try IconComposerExport(document: doc, isHidden: isHidden)
+            let panel = NSSavePanel()
+            panel.allowedContentTypes = [UTType(filenameExtension: "icon", conformingTo: .package) ?? .package]
+            panel.nameFieldStringValue = (doc.sourceURL?.deletingPathExtension().lastPathComponent ?? "AppIcon") + ".icon"
+            panel.message = "Top-level groups become Icon Composer groups; their children become layers."
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            try export.write(to: url)
+            if export.groups.count > IconComposerExport.recommendedMaxGroups {
+                presentMessage(
+                    title: "Exported \(export.groups.count) Groups",
+                    message: "Icon Composer works best with up to \(IconComposerExport.recommendedMaxGroups) groups. "
+                        + "Combine top-level elements into <g> groups to reduce the number of groups."
+                )
+            }
+        } catch {
+            presentError(error)
+        }
+    }
+
     private func validateDocument(_ doc: SVGDocument) throws {
         guard doc.root.elementName == "svg" else {
             throw SVGValidationError.invalidRoot
         }
-        try validateDimension(doc.root.attributes["width"], name: "width")
-        try validateDimension(doc.root.attributes["height"], name: "height")
+        let attributes = doc.root.attributes
+        for name in ["width", "height"] {
+            if let value = attributes[name], !Self.isValidLength(value) {
+                throw SVGValidationError.invalidDimension(name: name, value: value)
+            }
+        }
+        if let viewBox = attributes["viewBox"] {
+            guard SVGViewBox.parse(viewBox) != nil else {
+                throw SVGValidationError.invalidViewBox(value: viewBox)
+            }
+        } else if SVGViewBox.canvas(of: attributes) == nil {
+            // Apple's icon assets only carry a viewBox; width/height alone are fine too.
+            throw SVGValidationError.missingCanvas
+        }
     }
 
-    private func validateDimension(_ value: String?, name: String) throws {
-        guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw SVGValidationError.missingDimension(name: name)
+    private static func isValidLength(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasSuffix("%") {
+            return Double(trimmed.dropLast()) != nil
         }
-        if Double(value) == nil {
-            throw SVGValidationError.invalidDimension(name: name, value: value)
-        }
+        return SVGLength.parse(trimmed) != nil
     }
-    
+
+    // MARK: Structure
+
     func insertFromClipboard() {
         guard var doc = document else { return }
         do {
             let nodes = try clipboard.readNodes(mode: clipboardMode)
             pushUndoSnapshot(for: doc)
-            let target = selectedNode(in: doc) ?? doc.root
-            target.children.append(contentsOf: nodes)
+            let (target, index) = insertionPoint(in: doc)
+            target.children.insert(contentsOf: nodes, at: index)
             doc.isDirty = true
             document = doc
+            if let first = nodes.first {
+                selectedNodeID = first.id
+            }
         } catch {
             presentError(error)
         }
@@ -368,11 +554,18 @@ final class SVGLayerEditorViewModel: ObservableObject {
         moveSelection(by: 1)
     }
 
+    var canIndentSelection: Bool {
+        guard let doc = document, let selectedID = selectedNodeID,
+              let parent = doc.root.findParent(of: selectedID),
+              let index = parent.children.firstIndex(where: { $0.id == selectedID }), index > 0 else { return false }
+        return SVGShapeGeometry.containerElements.contains(parent.children[index - 1].elementName)
+    }
+
+    /// Moves the selection into the preceding sibling group.
     func indentSelection() {
-        guard var doc = document, let selectedID = selectedNodeID else { return }
-        guard let parent = doc.root.findParent(of: selectedID),
+        guard canIndentSelection, var doc = document, let selectedID = selectedNodeID,
+              let parent = doc.root.findParent(of: selectedID),
               let index = parent.children.firstIndex(where: { $0.id == selectedID }) else { return }
-        if index == 0 { return }
         pushUndoSnapshot(for: doc)
         let newParent = parent.children[index - 1]
         let node = parent.children.remove(at: index)
@@ -385,9 +578,8 @@ final class SVGLayerEditorViewModel: ObservableObject {
         guard var doc = document, let selectedID = selectedNodeID else { return }
         guard let parent = doc.root.findParent(of: selectedID),
               let grandParent = doc.root.findParent(of: parent.id),
-              let parentIndex = grandParent.children.firstIndex(where: { $0.id == parent.id }) else { return }
-        let nodeIndex = parent.children.firstIndex(where: { $0.id == selectedID })
-        guard let nodeIndex else { return }
+              let parentIndex = grandParent.children.firstIndex(where: { $0.id == parent.id }),
+              let nodeIndex = parent.children.firstIndex(where: { $0.id == selectedID }) else { return }
         pushUndoSnapshot(for: doc)
         let node = parent.children.remove(at: nodeIndex)
         grandParent.children.insert(node, at: parentIndex + 1)
@@ -395,19 +587,29 @@ final class SVGLayerEditorViewModel: ObservableObject {
         document = doc
     }
 
-    func createEmptyDocument() {
+    func createEmptyDocument(size: CGFloat = defaultDocumentSize) {
+        let side = SVGFormat.number(max(size, 1))
         let root = LayerNode(
             elementName: "svg",
             attributes: [
-                "xmlns": "http://www.w3.org/2000/svg",
-                "width": "100",
-                "height": "100",
-                "viewBox": "0 0 100 100"
+                "xmlns": SVGSerializer.svgNamespace,
+                "width": side,
+                "height": side,
+                "viewBox": "0 0 \(side) \(side)"
             ]
         )
+        replaceSecurityScope(with: nil)
         document = SVGDocument(root: root)
         lastReferenceNodeID = nil
         selectedNodeID = root.id
+        resetUndoStack()
+    }
+
+    private func closeDocument() {
+        replaceSecurityScope(with: nil)
+        document = nil
+        selectedNodeID = nil
+        lastReferenceNodeID = nil
         resetUndoStack()
     }
 
@@ -428,18 +630,37 @@ final class SVGLayerEditorViewModel: ObservableObject {
         return document.root.findNode(by: selectedID)
     }
 
+    /// New content goes into the selected group, or right after the selected element.
+    private func insertionPoint(in doc: SVGDocument) -> (parent: LayerNode, index: Int) {
+        if let selected = selectedNode(in: doc) {
+            if SVGShapeGeometry.containerElements.contains(selected.elementName) {
+                return (selected, selected.children.count)
+            }
+            if let parent = doc.root.findParent(of: selected.id),
+               let index = parent.children.firstIndex(where: { $0.id == selected.id }) {
+                return (parent, index + 1)
+            }
+        }
+        return (doc.root, doc.root.children.count)
+    }
+
     private func writeDocument(_ doc: SVGDocument, to url: URL) throws {
         let output = serializer.serialize(document: doc)
         try output.write(to: url, atomically: true, encoding: .utf8)
     }
 
     private func presentError(_ error: Error) {
-        errorMessage = error.localizedDescription
+        presentMessage(title: "Error", message: error.localizedDescription)
+    }
+
+    private func presentMessage(title: String, message: String) {
+        alertTitle = title
+        errorMessage = message
         isShowingError = true
     }
 
     func moveNode(draggedID: UUID, targetID: UUID?) {
-        guard var doc = document else { return }
+        guard var doc = document, draggedID != targetID else { return }
         guard let draggedParent = doc.root.findParent(of: draggedID) else { return }
         guard let draggedIndex = draggedParent.children.firstIndex(where: { $0.id == draggedID }) else { return }
         let draggedNode = draggedParent.children[draggedIndex]
@@ -473,64 +694,56 @@ final class SVGLayerEditorViewModel: ObservableObject {
         document = doc
     }
 
-    func confirmCloseIfNeeded() -> Bool {
-        guard isDirty else { return true }
-        let alert = NSAlert()
-        alert.messageText = "Unsaved Changes"
-        alert.informativeText = "You have unsaved changes. Do you want to close without saving?"
-        alert.addButton(withTitle: "Close")
-        alert.addButton(withTitle: "Cancel")
-        return alert.runModal() == .alertFirstButtonReturn
-    }
-
     func toggleVisibility(for nodeID: UUID) {
         guard var doc = document, let node = doc.root.findNode(by: nodeID) else { return }
         pushUndoSnapshot(for: doc)
-        if node.attributes["display"] == "none" {
-            node.attributes["display"] = "inline"
+        if isHidden(node) {
+            // Remove instead of writing display="inline", which only adds noise to the file.
+            SVGStyle.set("display", to: nil, in: &node.attributes)
+            node.attributes.removeValue(forKey: "display")
         } else {
-            node.attributes["display"] = "none"
+            SVGStyle.set("display", to: "none", in: &node.attributes)
         }
         doc.isDirty = true
         document = doc
     }
 
-    struct SVGPreviewPath: Identifiable {
-        let id: UUID
-        let elementName: String
-        let attributes: [String: String]
-        let d: String?
-        let text: String?
-        let fill: String?
-        let stroke: String?
-        let opacity: Double?
-    }
+    // MARK: Preview
 
     var previewViewBox: CGRect {
         guard let doc = document else { return CGRect(x: 0, y: 0, width: 100, height: 100) }
-        if let viewBoxValue = doc.root.attributes["viewBox"], let rect = parseViewBox(viewBoxValue) {
-            return rect
-        }
-        if let width = doc.root.attributes["width"], let height = doc.root.attributes["height"],
-           let w = Double(width), let h = Double(height) {
-            return CGRect(x: 0, y: 0, width: w, height: h)
-        }
-        return CGRect(x: 0, y: 0, width: 100, height: 100)
+        return SVGViewBox.canvas(of: doc.root.attributes) ?? CGRect(x: 0, y: 0, width: 100, height: 100)
     }
 
-    var previewPaths: [SVGPreviewPath] {
-        guard let doc = document else { return [] }
-        var result: [SVGPreviewPath] = []
-        collectPreviewPaths(from: doc.root, inheritedHidden: false, into: &result)
-        return result
+    /// Paint-ready content of the visible layers.
+    var previewScene: SVGRenderScene? {
+        guard let doc = document else { return nil }
+        if let cache = previewSceneCache, cache.version == documentVersion {
+            return cache.scene
+        }
+        let scene = SVGRenderScene(root: doc.root, canvas: previewViewBox, isHidden: isHidden)
+        previewSceneCache = (documentVersion, scene)
+        return scene
+    }
+
+    /// Like `previewScene`, but including hidden layers (bounds for align/rotate).
+    private var geometryScene: SVGRenderScene? {
+        guard let doc = document else { return nil }
+        if let cache = geometrySceneCache, cache.version == documentVersion {
+            return cache.scene
+        }
+        let scene = SVGRenderScene(root: doc.root, canvas: previewViewBox, isHidden: { _ in false })
+        geometrySceneCache = (documentVersion, scene)
+        return scene
     }
 
     func isHidden(_ node: LayerNode) -> Bool {
-        node.attributes["display"] == "none"
+        SVGStyle.value("display", in: node.attributes)?.trimmingCharacters(in: .whitespaces) == "none"
     }
 
     var hasReferenceSelection: Bool {
-        lastReferenceNodeID != nil
+        guard let referenceID = lastReferenceNodeID else { return false }
+        return document?.root.findNode(by: referenceID) != nil
     }
 
     func alignSelectedToCanvas(_ mode: AlignmentMode) {
@@ -538,16 +751,14 @@ final class SVGLayerEditorViewModel: ObservableObject {
     }
 
     func alignSelectedToReference(_ mode: AlignmentMode) {
-        guard let doc = document, let referenceID = lastReferenceNodeID,
-              let referenceNode = doc.root.findNode(by: referenceID),
-              let referenceBounds = boundsForNode(referenceNode) else { return }
+        guard let referenceID = lastReferenceNodeID,
+              let referenceBounds = canvasBounds(of: referenceID) else { return }
         alignSelected(to: referenceBounds, mode: mode)
     }
 
     private func alignSelected(to targetBounds: CGRect, mode: AlignmentMode) {
-        guard let doc = document, let selectedID = selectedNodeID,
-              let selectedNode = doc.root.findNode(by: selectedID),
-              let selectedBounds = boundsForNode(selectedNode) else { return }
+        guard let selectedID = selectedNodeID,
+              let selectedBounds = canvasBounds(of: selectedID) else { return }
 
         var deltaX: CGFloat = 0
         var deltaY: CGFloat = 0
@@ -567,9 +778,8 @@ final class SVGLayerEditorViewModel: ObservableObject {
             deltaY = targetBounds.midY - selectedBounds.midY
         }
 
-        if deltaX == 0 && deltaY == 0 { return }
-        let transform = CGAffineTransform(translationX: deltaX, y: deltaY)
-        transformElement(nodeID: selectedID, transform: transform)
+        if abs(deltaX) < 1e-9 && abs(deltaY) < 1e-9 { return }
+        transformElement(nodeID: selectedID, transform: CGAffineTransform(translationX: deltaX, y: deltaY))
     }
 
     enum AlignmentMode {
@@ -582,21 +792,35 @@ final class SVGLayerEditorViewModel: ObservableObject {
     }
 }
 
+// MARK: - Recent files, editor sync, parsing helpers
+
 extension SVGLayerEditorViewModel {
     private func loadRecentFiles() {
-        let urls = UserDefaults.standard.array(forKey: recentKey) as? [String] ?? []
-        recentFiles = urls.compactMap { URL(fileURLWithPath: $0) }
+        let defaults = UserDefaults.standard
+        if let stored = defaults.array(forKey: recentKey) as? [[String: Any]] {
+            recentEntries = stored.compactMap { entry in
+                guard let path = entry["path"] as? String else { return nil }
+                return RecentEntry(url: URL(fileURLWithPath: path), bookmark: entry["bookmark"] as? Data)
+            }
+        } else {
+            // Paths stored by version 1.0.x. Without a bookmark they can only be reopened outside the sandbox.
+            let paths = defaults.array(forKey: legacyRecentKey) as? [String] ?? []
+            recentEntries = paths.map { RecentEntry(url: URL(fileURLWithPath: $0), bookmark: nil) }
+        }
     }
 
     func addRecentFile(_ url: URL) {
-        var paths = recentFiles.map { $0.path }
-        paths.removeAll { $0 == url.path }
-        paths.insert(url.path, at: 0)
-        if paths.count > maxRecentCount {
-            paths = Array(paths.prefix(maxRecentCount))
+        // A security-scoped bookmark lets the sandboxed app reopen the file after relaunch.
+        let bookmark = try? url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
+        var entries = recentEntries.filter { $0.url.standardizedFileURL.path != url.standardizedFileURL.path }
+        entries.insert(RecentEntry(url: url, bookmark: bookmark), at: 0)
+        recentEntries = Array(entries.prefix(maxRecentCount))
+        let stored: [[String: Any]] = recentEntries.map { entry in
+            var value: [String: Any] = ["path": entry.url.path]
+            if let bookmark = entry.bookmark { value["bookmark"] = bookmark }
+            return value
         }
-        recentFiles = paths.map { URL(fileURLWithPath: $0) }
-        UserDefaults.standard.set(paths, forKey: recentKey)
+        UserDefaults.standard.set(stored, forKey: recentKey)
     }
 
     func syncSelectedNodeText() {
@@ -656,14 +880,41 @@ extension SVGLayerEditorViewModel {
         }
     }
 
-    func parseViewBox(_ value: String) -> CGRect? {
-        let parts = value.split { $0 == " " || $0 == "," }.map(String.init)
-        guard parts.count == 4,
-              let x = Double(parts[0]), let y = Double(parts[1]),
-              let w = Double(parts[2]), let h = Double(parts[3]) else { return nil }
-        return CGRect(x: x, y: y, width: w, height: h)
+    func nodePath(for nodeID: UUID, in document: SVGDocument) -> [Int]? {
+        if document.root.id == nodeID {
+            return []
+        }
+        return nodePath(for: nodeID, in: document.root)
     }
 
+    func nodeID(for path: [Int], in document: SVGDocument) -> UUID? {
+        if path.isEmpty {
+            return document.root.id
+        }
+        var node = document.root
+        for index in path {
+            guard node.children.indices.contains(index) else { return nil }
+            node = node.children[index]
+        }
+        return node.id
+    }
+
+    private func nodePath(for nodeID: UUID, in node: LayerNode) -> [Int]? {
+        for (index, child) in node.children.enumerated() {
+            if child.id == nodeID {
+                return [index]
+            }
+            if let childPath = nodePath(for: nodeID, in: child) {
+                return [index] + childPath
+            }
+        }
+        return nil
+    }
+}
+
+// MARK: - Shapes and colors
+
+extension SVGLayerEditorViewModel {
     func addRectangle() {
         addShape(elementName: "rect", attributes: defaultRectAttributes())
     }
@@ -697,31 +948,52 @@ extension SVGLayerEditorViewModel {
     }
 
     func setFillColor(_ color: Color) {
-        lastFillHex = color.hexString
-        updateSelectedAttributes { $0["fill"] = color.hexString }
+        setPaint("fill", color: color)
     }
 
     func setStrokeColor(_ color: Color) {
-        lastStrokeHex = color.hexString
-        updateSelectedAttributes { $0["stroke"] = color.hexString }
+        setPaint("stroke", color: color)
+    }
+
+    private func setPaint(_ property: String, color: Color) {
+        guard let selectedID = selectedNodeID, let svgColor = SVGColor(color) else { return }
+        let hex = svgColor.hexString
+        if property == "fill" { lastFillHex = hex } else { lastStrokeHex = hex }
+        updateSelectedAttributes(coalescingKey: "\(property):\(selectedID)") { attributes in
+            SVGStyle.set(property, to: hex, in: &attributes)
+            let opacity = svgColor.alpha < 0.999 ? SVGFormat.number(CGFloat(svgColor.alpha), fractionDigits: 3) : nil
+            SVGStyle.set("\(property)-opacity", to: opacity, in: &attributes)
+        }
     }
 
     private func addShape(elementName: String, attributes: [String: String], text: String? = nil) {
         guard var doc = document else { return }
         pushUndoSnapshot(for: doc)
+        let (target, index) = insertionPoint(in: doc)
+        var attributes = attributes
+        // Default positions are canvas coordinates; compensate a transformed target group.
+        if let parentCTM = SVGShapeGeometry.parentTransform(of: target.id, in: doc.root) {
+            let targetCTM = SVGShapeGeometry.localTransform(of: target, isDocumentRoot: target === doc.root)
+                .concatenating(parentCTM)
+            if !targetCTM.isIdentity, let transform = SVGTransform.format(targetCTM.inverted()) {
+                attributes["transform"] = transform
+            }
+        }
         let node = LayerNode(elementName: elementName, attributes: attributes, text: text)
-        let target = selectedNode(in: doc) ?? doc.root
-        target.children.append(node)
+        target.children.insert(node, at: index)
         doc.isDirty = true
         document = doc
         selectedNodeID = node.id
     }
 
-    private func updateSelectedAttributes(_ mutate: (inout [String: String]) -> Void) {
+    private func updateSelectedAttributes(coalescingKey: String? = nil, _ mutate: (inout [String: String]) -> Void) {
         guard var doc = document, let selectedID = selectedNodeID,
               let node = doc.root.findNode(by: selectedID) else { return }
-        pushUndoSnapshot(for: doc)
-        mutate(&node.attributes)
+        var attributes = node.attributes
+        mutate(&attributes)
+        guard attributes != node.attributes else { return }
+        pushUndoSnapshot(for: doc, coalescingKey: coalescingKey)
+        node.attributes = attributes
         doc.isDirty = true
         document = doc
     }
@@ -730,17 +1002,14 @@ extension SVGLayerEditorViewModel {
         let box = previewViewBox
         let w = max(box.width * 0.25, 10)
         let h = max(box.height * 0.25, 10)
-        let x = box.midX - w / 2
-        let y = box.midY - h / 2
         return [
-            "x": format(x),
-            "y": format(y),
+            "x": format(box.midX - w / 2),
+            "y": format(box.midY - h / 2),
             "width": format(w),
             "height": format(h),
-            "rx": "0",
-            "ry": "0",
             "fill": lastFillHex,
-            "stroke": lastStrokeHex
+            "stroke": lastStrokeHex,
+            "stroke-width": format(strokeWidth(for: box))
         ]
     }
 
@@ -752,21 +1021,21 @@ extension SVGLayerEditorViewModel {
             "cy": format(box.midY),
             "r": format(r),
             "fill": lastFillHex,
-            "stroke": lastStrokeHex
+            "stroke": lastStrokeHex,
+            "stroke-width": format(strokeWidth(for: box))
         ]
     }
 
     private func defaultEllipseAttributes() -> [String: String] {
         let box = previewViewBox
-        let rx = max(box.width * 0.18, 8)
-        let ry = max(box.height * 0.12, 8)
         return [
             "cx": format(box.midX),
             "cy": format(box.midY),
-            "rx": format(rx),
-            "ry": format(ry),
+            "rx": format(max(box.width * 0.18, 8)),
+            "ry": format(max(box.height * 0.12, 8)),
             "fill": lastFillHex,
-            "stroke": lastStrokeHex
+            "stroke": lastStrokeHex,
+            "stroke-width": format(strokeWidth(for: box))
         ]
     }
 
@@ -777,9 +1046,9 @@ extension SVGLayerEditorViewModel {
             "y1": format(box.midY),
             "x2": format(box.midX + box.width * 0.15),
             "y2": format(box.midY),
+            "fill": "none",
             "stroke": lastStrokeHex,
-            "stroke-width": "2",
-            "fill": "none"
+            "stroke-width": format(strokeWidth(for: box))
         ]
     }
 
@@ -787,15 +1056,16 @@ extension SVGLayerEditorViewModel {
         let box = previewViewBox
         let w = max(box.width * 0.18, 10)
         let h = max(box.height * 0.18, 10)
-        let cx = box.midX
-        let cy = box.midY
-        let p1 = "\(format(cx)) \(format(cy - h))"
-        let p2 = "\(format(cx + w)) \(format(cy + h))"
-        let p3 = "\(format(cx - w)) \(format(cy + h))"
+        let points = [
+            CGPoint(x: box.midX, y: box.midY - h),
+            CGPoint(x: box.midX + w, y: box.midY + h),
+            CGPoint(x: box.midX - w, y: box.midY + h)
+        ]
         return [
-            "points": "\(p1) \(p2) \(p3)",
+            "points": SVGPoints.serialize(points),
             "fill": lastFillHex,
-            "stroke": lastStrokeHex
+            "stroke": lastStrokeHex,
+            "stroke-width": format(strokeWidth(for: box))
         ]
     }
 
@@ -803,358 +1073,200 @@ extension SVGLayerEditorViewModel {
         let box = previewViewBox
         let w = max(box.width * 0.2, 12)
         let h = max(box.height * 0.12, 12)
-        let cx = box.midX
-        let cy = box.midY
-        let p1 = "\(format(cx - w)) \(format(cy - h))"
-        let p2 = "\(format(cx)) \(format(cy + h))"
-        let p3 = "\(format(cx + w)) \(format(cy - h))"
+        let points = [
+            CGPoint(x: box.midX - w, y: box.midY - h),
+            CGPoint(x: box.midX, y: box.midY + h),
+            CGPoint(x: box.midX + w, y: box.midY - h)
+        ]
         return [
-            "points": "\(p1) \(p2) \(p3)",
+            "points": SVGPoints.serialize(points),
+            "fill": "none",
             "stroke": lastStrokeHex,
-            "stroke-width": "2",
-            "fill": "none"
+            "stroke-width": format(strokeWidth(for: box))
         ]
     }
 
     private func defaultTextAttributes() -> [String: String] {
         let box = previewViewBox
+        let fontSize = max((min(box.width, box.height) * 0.12).rounded(), 12)
         return [
             "x": format(box.midX),
-            "y": format(box.midY),
-            "font-size": "18",
+            "y": format(box.midY + fontSize / 3),
+            // An explicit family keeps preview, browsers and Icon Composer (CoreSVG) consistent.
+            "font-family": "Helvetica, Arial, sans-serif",
+            "font-size": format(fontSize),
+            "text-anchor": "middle",
             "fill": lastFillHex
         ]
     }
 
+    /// Stroke width that stays visible on both 100 and 1024 unit canvases.
+    private func strokeWidth(for box: CGRect) -> CGFloat {
+        max((min(box.width, box.height) / 100).rounded(), 1)
+    }
+
     private func format(_ value: CGFloat) -> String {
-        String(format: "%.2f", value)
+        SVGFormat.number(value)
     }
 }
 
-private extension Color {
-    var hexString: String {
-        let nsColor = NSColor(self).usingColorSpace(.deviceRGB) ?? NSColor(self)
-        let r = Int(round(nsColor.redComponent * 255))
-        let g = Int(round(nsColor.greenComponent * 255))
-        let b = Int(round(nsColor.blueComponent * 255))
-        return String(format: "#%02X%02X%02X", r, g, b)
+// MARK: - Transforms
+
+extension SVGLayerEditorViewModel {
+    /// Canvas-space bounds of a node (union of its painted content for groups).
+    func canvasBounds(of nodeID: UUID) -> CGRect? {
+        geometryScene?.boundsByID[nodeID]
     }
 
-    init?(svg value: String) {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if trimmed.hasPrefix("#") {
-            self.init(hex: trimmed)
-            return
-        }
-        if trimmed.hasPrefix("rgb(") && trimmed.hasSuffix(")") {
-            let inner = trimmed.dropFirst(4).dropLast()
-            let parts = inner.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-            guard parts.count == 3,
-                  let r = Double(parts[0]), let g = Double(parts[1]), let b = Double(parts[2]) else { return nil }
-            self = Color(.sRGB, red: r / 255.0, green: g / 255.0, blue: b / 255.0, opacity: 1.0)
-            return
-        }
-        switch trimmed {
-        case "black": self = .black
-        case "white": self = .white
-        case "red": self = .red
-        case "green": self = .green
-        case "blue": self = .blue
-        case "gray", "grey": self = .gray
-        case "yellow": self = .yellow
-        case "cyan": self = .cyan
-        case "magenta": self = Color(.sRGB, red: 1.0, green: 0.0, blue: 1.0, opacity: 1.0)
-        case "orange": self = Color(.sRGB, red: 1.0, green: 0.55, blue: 0.0, opacity: 1.0)
-        default: return nil
-        }
+    func rotateSelected(by degrees: CGFloat) {
+        guard let selectedID = selectedNodeID,
+              let bounds = canvasBounds(of: selectedID) else { return }
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let transform = CGAffineTransform(translationX: center.x, y: center.y)
+            .rotated(by: degrees * .pi / 180)
+            .translatedBy(x: -center.x, y: -center.y)
+        transformElement(nodeID: selectedID, transform: transform)
     }
 
-    init?(hex: String) {
-        var value = hex.trimmingCharacters(in: .whitespacesAndNewlines)
-        if value.hasPrefix("#") {
-            value.removeFirst()
-        }
-        let length = value.count
-        guard length == 6 || length == 8 else { return nil }
+    /// Applies `transform`, given in canvas (viewBox) coordinates, to an element.
+    ///
+    /// Geometry attributes are rewritten when the element can represent the result exactly
+    /// (paths, polygons, lines; axis-aligned changes of rects, ellipses, text). Otherwise —
+    /// e.g. rotating a rect, moving a group — the element's `transform` attribute is updated,
+    /// so shapes never get distorted.
+    func transformElement(nodeID: UUID, transform: CGAffineTransform, coalescingKey: String? = nil) {
+        guard var doc = document,
+              let node = doc.root.findNode(by: nodeID), node !== doc.root,
+              let parentCTM = SVGShapeGeometry.parentTransform(of: nodeID, in: doc.root),
+              Self.isInvertible(parentCTM) else { return }
 
-        var hexNumber: UInt64 = 0
-        let scanner = Scanner(string: value)
-        guard scanner.scanHexInt64(&hexNumber) else { return nil }
-
-        let r, g, b, a: Double
-        if length == 6 {
-            r = Double((hexNumber & 0xFF0000) >> 16) / 255.0
-            g = Double((hexNumber & 0x00FF00) >> 8) / 255.0
-            b = Double(hexNumber & 0x0000FF) / 255.0
-            a = 1.0
+        let newAttributes: [String: String]?
+        if node.elementName == "svg" {
+            // Nested <svg>: x/y/width/height live in the parent's user space; no transform attribute in SVG 1.1.
+            let local = parentCTM.concatenating(transform).concatenating(parentCTM.inverted())
+            newAttributes = Self.viewportAttributes(of: node, applying: local)
         } else {
-            r = Double((hexNumber & 0xFF000000) >> 24) / 255.0
-            g = Double((hexNumber & 0x00FF0000) >> 16) / 255.0
-            b = Double((hexNumber & 0x0000FF00) >> 8) / 255.0
-            a = Double(hexNumber & 0x000000FF) / 255.0
+            // A malformed transform attribute is left alone rather than guessed.
+            guard let own = SVGTransform.parse(node.attributes["transform"]) else { return }
+            let geometrySpace = own.concatenating(parentCTM)
+            if Self.isInvertible(geometrySpace) {
+                let local = geometrySpace.concatenating(transform).concatenating(geometrySpace.inverted())
+                newAttributes = Self.geometryAttributes(of: node, applying: local)
+                    ?? Self.transformAttributes(of: node, own: own, parentCTM: parentCTM, canvasTransform: transform)
+            } else {
+                newAttributes = nil
+            }
         }
 
-        self = Color(.sRGB, red: r, green: g, blue: b, opacity: a)
+        guard let newAttributes, newAttributes != node.attributes else { return }
+        pushUndoSnapshot(for: doc, coalescingKey: coalescingKey)
+        node.attributes = newAttributes
+        doc.isDirty = true
+        document = doc
+    }
+
+    private static func isInvertible(_ t: CGAffineTransform) -> Bool {
+        abs(t.a * t.d - t.b * t.c) > 1e-12
+    }
+
+    private static func transformAttributes(of node: LayerNode, own: CGAffineTransform, parentCTM: CGAffineTransform,
+                                            canvasTransform: CGAffineTransform) -> [String: String] {
+        let parentLocal = parentCTM.concatenating(canvasTransform).concatenating(parentCTM.inverted())
+        var attributes = node.attributes
+        attributes["transform"] = SVGTransform.format(own.concatenating(parentLocal))
+        return attributes
+    }
+
+    /// Rewrites geometry in the element's own user space, or nil if the element cannot represent `t`.
+    private static func geometryAttributes(of node: LayerNode, applying t: CGAffineTransform) -> [String: String]? {
+        var a = node.attributes
+        func n(_ key: String) -> CGFloat? { SVGLength.number(a, key) }
+        func f(_ value: CGFloat) -> String { SVGFormat.number(value) }
+        let axisAligned = SVGTransform.isAxisAligned(t)
+
+        switch node.elementName {
+        case "path":
+            guard let d = a["d"], let path = SVGPathParser.toPath(d, strict: true) else { return nil }
+            var transform = t
+            guard let transformed = path.copy(using: &transform) else { return nil }
+            a["d"] = SVGPathParser.serialize(path: transformed)
+        case "line":
+            let p1 = CGPoint(x: n("x1") ?? 0, y: n("y1") ?? 0).applying(t)
+            let p2 = CGPoint(x: n("x2") ?? 0, y: n("y2") ?? 0).applying(t)
+            a["x1"] = f(p1.x); a["y1"] = f(p1.y); a["x2"] = f(p2.x); a["y2"] = f(p2.y)
+        case "polygon", "polyline":
+            guard let points = SVGPoints.parse(a["points"]) else { return nil }
+            a["points"] = SVGPoints.serialize(points.map { $0.applying(t) })
+        case "rect", "image":
+            guard axisAligned, let w = n("width"), let h = n("height") else { return nil }
+            let rect = CGRect(x: n("x") ?? 0, y: n("y") ?? 0, width: w, height: h).applying(t)
+            a["x"] = f(rect.minX); a["y"] = f(rect.minY); a["width"] = f(rect.width); a["height"] = f(rect.height)
+            if let rx = n("rx") { a["rx"] = f(rx * abs(t.a)) }
+            if let ry = n("ry") { a["ry"] = f(ry * abs(t.d)) }
+        case "use":
+            guard axisAligned, abs(t.a - 1) < 1e-9, abs(t.d - 1) < 1e-9 else { return nil }
+            a["x"] = f((n("x") ?? 0) + t.tx); a["y"] = f((n("y") ?? 0) + t.ty)
+        case "circle":
+            // Circles survive similarity transforms (move, uniform scale, rotation, mirroring).
+            let isSimilarity = abs(t.a * t.c + t.b * t.d) < 1e-9
+                && abs((t.a * t.a + t.b * t.b) - (t.c * t.c + t.d * t.d)) < 1e-9
+            guard isSimilarity, let r = n("r") else { return nil }
+            let center = CGPoint(x: n("cx") ?? 0, y: n("cy") ?? 0).applying(t)
+            a["cx"] = f(center.x); a["cy"] = f(center.y)
+            a["r"] = f(r * sqrt(t.a * t.a + t.b * t.b))
+        case "ellipse":
+            guard axisAligned, let rx = n("rx"), let ry = n("ry") else { return nil }
+            let center = CGPoint(x: n("cx") ?? 0, y: n("cy") ?? 0).applying(t)
+            a["cx"] = f(center.x); a["cy"] = f(center.y)
+            a["rx"] = f(rx * abs(t.a)); a["ry"] = f(ry * abs(t.d))
+        case "text":
+            // The anchor point moves with the transform; glyphs scale with font-size (uniform scale only).
+            guard axisAligned, t.a > 0, abs(t.a - t.d) < 1e-9,
+                  let x = SVGLength.parse(a["x"] ?? "0"), let y = SVGLength.parse(a["y"] ?? "0") else { return nil }
+            let anchor = CGPoint(x: x, y: y).applying(t)
+            a["x"] = f(anchor.x); a["y"] = f(anchor.y)
+            if abs(t.a - 1) > 1e-9 {
+                let size = SVGTextMetrics.resolvedFontSize(attributes: a) * t.a
+                SVGStyle.set("font-size", to: f(size), in: &a)
+            }
+        default:
+            return nil
+        }
+        return a
+    }
+
+    private static func viewportAttributes(of node: LayerNode, applying t: CGAffineTransform) -> [String: String]? {
+        guard SVGTransform.isAxisAligned(t) else { return nil }
+        var a = node.attributes
+        let origin = CGPoint(x: SVGLength.number(a, "x") ?? 0, y: SVGLength.number(a, "y") ?? 0)
+        if let w = SVGLength.number(a, "width"), let h = SVGLength.number(a, "height") {
+            let rect = CGRect(origin: origin, size: CGSize(width: w, height: h)).applying(t)
+            a["x"] = SVGFormat.number(rect.minX); a["y"] = SVGFormat.number(rect.minY)
+            a["width"] = SVGFormat.number(rect.width); a["height"] = SVGFormat.number(rect.height)
+        } else {
+            guard abs(t.a - 1) < 1e-9, abs(t.d - 1) < 1e-9 else { return nil }
+            a["x"] = SVGFormat.number(origin.x + t.tx); a["y"] = SVGFormat.number(origin.y + t.ty)
+        }
+        return a
     }
 }
 
 private enum SVGValidationError: LocalizedError {
     case invalidRoot
-    case missingDimension(name: String)
+    case missingCanvas
     case invalidDimension(name: String, value: String)
+    case invalidViewBox(value: String)
 
     var errorDescription: String? {
         switch self {
         case .invalidRoot:
             return "Root element must be <svg>."
-        case .missingDimension(let name):
-            return "Missing SVG \(name)."
+        case .missingCanvas:
+            return "The <svg> root needs a viewBox or width and height."
         case .invalidDimension(let name, let value):
             return "Invalid SVG \(name): \(value)."
+        case .invalidViewBox(let value):
+            return "Invalid viewBox: \(value). Expected four numbers: min-x min-y width height."
         }
-    }
-}
-
-extension SVGLayerEditorViewModel {
-    private func collectPreviewPaths(from node: LayerNode, inheritedHidden: Bool, into result: inout [SVGPreviewPath]) {
-        let isNodeHidden = inheritedHidden || isHidden(node)
-        let drawable = ["path", "rect", "circle", "ellipse", "line", "polygon", "polyline", "text"]
-        if drawable.contains(node.elementName), !isNodeHidden {
-            let opacityValue = Double(node.attributes["opacity"] ?? "") ?? Double(node.attributes["fill-opacity"] ?? "")
-            result.append(SVGPreviewPath(
-                id: node.id,
-                elementName: node.elementName,
-                attributes: node.attributes,
-                d: node.attributes["d"],
-                text: node.text,
-                fill: node.attributes["fill"],
-                stroke: node.attributes["stroke"],
-                opacity: opacityValue
-            ))
-        }
-        for child in node.children {
-            collectPreviewPaths(from: child, inheritedHidden: isNodeHidden, into: &result)
-        }
-    }
-
-    func transformPath(nodeID: UUID, transform: CGAffineTransform) {
-        guard var doc = document, let node = doc.root.findNode(by: nodeID) else { return }
-        guard let d = node.attributes["d"], let path = SVGPathParser.toPath(d) else { return }
-        pushUndoSnapshot(for: doc)
-        var mutableTransform = transform
-        let transformed = path.copy(using: &mutableTransform) ?? path
-        let newD = SVGPathParser.serialize(path: transformed)
-        node.attributes["d"] = newD
-        doc.isDirty = true
-        document = doc
-    }
-
-    func transformElement(nodeID: UUID, transform: CGAffineTransform) {
-        guard var doc = document, let node = doc.root.findNode(by: nodeID) else { return }
-        pushUndoSnapshot(for: doc)
-        switch node.elementName {
-        case "path":
-            guard let d = node.attributes["d"], let path = SVGPathParser.toPath(d) else { return }
-            var mutableTransform = transform
-            let transformed = path.copy(using: &mutableTransform) ?? path
-            node.attributes["d"] = SVGPathParser.serialize(path: transformed)
-        case "rect":
-            guard let rect = readRect(from: node.attributes) else { return }
-            let newRect = transformRect(rect, by: transform)
-            node.attributes["x"] = format(newRect.origin.x)
-            node.attributes["y"] = format(newRect.origin.y)
-            node.attributes["width"] = format(newRect.width)
-            node.attributes["height"] = format(newRect.height)
-        case "circle":
-            guard let cx = number(node.attributes["cx"]),
-                  let cy = number(node.attributes["cy"]),
-                  let r = number(node.attributes["r"]) else { return }
-            let center = CGPoint(x: cx, y: cy).applying(transform)
-            let sx = abs(transform.a)
-            let sy = abs(transform.d)
-            let scale = max(sx, sy)
-            node.attributes["cx"] = format(center.x)
-            node.attributes["cy"] = format(center.y)
-            node.attributes["r"] = format(r * scale)
-        case "ellipse":
-            guard let cx = number(node.attributes["cx"]),
-                  let cy = number(node.attributes["cy"]),
-                  let rx = number(node.attributes["rx"]),
-                  let ry = number(node.attributes["ry"]) else { return }
-            let center = CGPoint(x: cx, y: cy).applying(transform)
-            let sx = abs(transform.a)
-            let sy = abs(transform.d)
-            node.attributes["cx"] = format(center.x)
-            node.attributes["cy"] = format(center.y)
-            node.attributes["rx"] = format(rx * sx)
-            node.attributes["ry"] = format(ry * sy)
-        case "line":
-            guard let x1 = number(node.attributes["x1"]),
-                  let y1 = number(node.attributes["y1"]),
-                  let x2 = number(node.attributes["x2"]),
-                  let y2 = number(node.attributes["y2"]) else { return }
-            let p1 = CGPoint(x: x1, y: y1).applying(transform)
-            let p2 = CGPoint(x: x2, y: y2).applying(transform)
-            node.attributes["x1"] = format(p1.x)
-            node.attributes["y1"] = format(p1.y)
-            node.attributes["x2"] = format(p2.x)
-            node.attributes["y2"] = format(p2.y)
-        case "polygon", "polyline":
-            guard let points = node.attributes["points"], let list = parsePoints(points) else { return }
-            let transformed = list.map { $0.applying(transform) }
-            node.attributes["points"] = serializePoints(transformed)
-        case "text":
-            guard let bounds = SVGTextMetrics.bounds(attributes: node.attributes, text: node.text) else { return }
-            let newBounds = transformRect(bounds, by: transform)
-            let fontSize = SVGTextMetrics.resolvedFontSize(attributes: node.attributes)
-            node.attributes["x"] = format(newBounds.origin.x)
-            node.attributes["y"] = format(newBounds.origin.y)
-            node.attributes["font-size"] = format(fontSize * SVGTextMetrics.scaleFactor(from: transform))
-        default:
-            return
-        }
-        doc.isDirty = true
-        document = doc
-    }
-
-    private func number(_ value: String?) -> CGFloat? {
-        guard let value, let d = Double(value) else { return nil }
-        return CGFloat(d)
-    }
-
-    private func readRect(from attrs: [String: String]) -> CGRect? {
-        guard let x = number(attrs["x"]),
-              let y = number(attrs["y"]),
-              let w = number(attrs["width"]),
-              let h = number(attrs["height"]) else { return nil }
-        return CGRect(x: x, y: y, width: w, height: h)
-    }
-
-    private func transformRect(_ rect: CGRect, by transform: CGAffineTransform) -> CGRect {
-        let p1 = CGPoint(x: rect.minX, y: rect.minY).applying(transform)
-        let p2 = CGPoint(x: rect.maxX, y: rect.maxY).applying(transform)
-        let minX = min(p1.x, p2.x)
-        let minY = min(p1.y, p2.y)
-        let maxX = max(p1.x, p2.x)
-        let maxY = max(p1.y, p2.y)
-        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
-    }
-
-    func parsePoints(_ value: String) -> [CGPoint]? {
-        let parts = value
-            .split { $0 == " " || $0 == "," || $0 == "\n" || $0 == "\t" }
-            .map(String.init)
-        if parts.count < 2 { return nil }
-        var points: [CGPoint] = []
-        var index = 0
-        while index + 1 < parts.count {
-            if let x = Double(parts[index]), let y = Double(parts[index + 1]) {
-                points.append(CGPoint(x: x, y: y))
-            }
-            index += 2
-        }
-        return points.isEmpty ? nil : points
-    }
-
-    func serializePoints(_ points: [CGPoint]) -> String {
-        points.map { "\(format($0.x)) \(format($0.y))" }.joined(separator: " ")
-    }
-
-    func rotateSelected(by degrees: CGFloat) {
-        guard let doc = document, let selectedID = selectedNodeID,
-              let node = doc.root.findNode(by: selectedID),
-              let bounds = boundsForNode(node) else { return }
-        let center = CGPoint(x: bounds.midX, y: bounds.midY)
-        let radians = degrees * .pi / 180.0
-        let transform = CGAffineTransform(translationX: center.x, y: center.y)
-            .rotated(by: radians)
-            .translatedBy(x: -center.x, y: -center.y)
-        transformElement(nodeID: selectedID, transform: transform)
-    }
-
-    private func boundsForNode(_ node: LayerNode) -> CGRect? {
-        switch node.elementName {
-        case "path":
-            guard let d = node.attributes["d"], let path = SVGPathParser.toPath(d) else { return nil }
-            return path.boundingBoxOfPath
-        case "rect":
-            return readRect(from: node.attributes)
-        case "circle":
-            guard let cx = number(node.attributes["cx"]),
-                  let cy = number(node.attributes["cy"]),
-                  let r = number(node.attributes["r"]) else { return nil }
-            return CGRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2)
-        case "ellipse":
-            guard let cx = number(node.attributes["cx"]),
-                  let cy = number(node.attributes["cy"]),
-                  let rx = number(node.attributes["rx"]),
-                  let ry = number(node.attributes["ry"]) else { return nil }
-            return CGRect(x: cx - rx, y: cy - ry, width: rx * 2, height: ry * 2)
-        case "line":
-            guard let x1 = number(node.attributes["x1"]),
-                  let y1 = number(node.attributes["y1"]),
-                  let x2 = number(node.attributes["x2"]),
-                  let y2 = number(node.attributes["y2"]) else { return nil }
-            return CGRect(x: min(x1, x2), y: min(y1, y2), width: abs(x2 - x1), height: abs(y2 - y1))
-        case "polygon", "polyline":
-            guard let points = node.attributes["points"], let list = parsePoints(points), !list.isEmpty else { return nil }
-            var bounds = CGRect.null
-            for point in list {
-                bounds = bounds.isNull ? CGRect(origin: point, size: .zero) : bounds.union(CGRect(origin: point, size: .zero))
-            }
-            return bounds
-        case "text":
-            return SVGTextMetrics.bounds(attributes: node.attributes, text: node.text)
-        default:
-            return nil
-        }
-    }
-
-    func rootAttribute(_ key: String) -> String {
-        document?.root.attributes[key] ?? ""
-    }
-
-    func setRootAttribute(_ key: String, value: String) {
-        guard var doc = document else { return }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        pushUndoSnapshot(for: doc)
-        if trimmed.isEmpty {
-            doc.root.attributes.removeValue(forKey: key)
-        } else {
-            doc.root.attributes[key] = trimmed
-        }
-        doc.isDirty = true
-        document = doc
-    }
-
-    func nodePath(for nodeID: UUID, in document: SVGDocument) -> [Int]? {
-        if document.root.id == nodeID {
-            return []
-        }
-        return nodePath(for: nodeID, in: document.root)
-    }
-
-    func nodeID(for path: [Int], in document: SVGDocument) -> UUID? {
-        if path.isEmpty {
-            return document.root.id
-        }
-        var node = document.root
-        for index in path {
-            guard node.children.indices.contains(index) else { return nil }
-            node = node.children[index]
-        }
-        return node.id
-    }
-
-    private func nodePath(for nodeID: UUID, in node: LayerNode) -> [Int]? {
-        for (index, child) in node.children.enumerated() {
-            if child.id == nodeID {
-                return [index]
-            }
-            if let childPath = nodePath(for: nodeID, in: child) {
-                return [index] + childPath
-            }
-        }
-        return nil
     }
 }

@@ -23,6 +23,10 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(borderColorHex, forKey: Keys.borderColorHex) }
     }
 
+    @Published var newDocumentSize: Double {
+        didSet { defaults.set(newDocumentSize, forKey: Keys.newDocumentSize) }
+    }
+
     @Published var editorFontDesignRawValue: String {
         didSet { defaults.set(editorFontDesignRawValue, forKey: Keys.editorFontDesign) }
     }
@@ -56,6 +60,8 @@ final class AppSettings: ObservableObject {
         self.gridSpacing = defaults.object(forKey: Keys.gridSpacing) as? Double ?? 50
         self.gridColorHex = defaults.string(forKey: Keys.gridColorHex) ?? "#80808040"
         self.borderColorHex = defaults.string(forKey: Keys.borderColorHex) ?? "#80808080"
+        self.newDocumentSize = defaults.object(forKey: Keys.newDocumentSize) as? Double
+            ?? Double(SVGLayerEditorViewModel.defaultDocumentSize)
         self.editorFontDesignRawValue = defaults.string(forKey: Keys.editorFontDesign) ?? PlainTextEditorFontDesign.monospaced.rawValue
         self.editorFontSize = defaults.object(forKey: Keys.editorFontSize) as? Double ?? Double(NSFont.smallSystemFontSize)
         self.editorWrapLines = defaults.object(forKey: Keys.editorWrapLines) as? Bool ?? true
@@ -67,6 +73,7 @@ final class AppSettings: ObservableObject {
     var moveSensitivityValue: CGFloat { CGFloat(moveSensitivity) }
     var resizeSensitivityValue: CGFloat { CGFloat(resizeSensitivity) }
     var gridSpacingValue: CGFloat { CGFloat(gridSpacing) }
+    var newDocumentSizeValue: CGFloat { CGFloat(max(newDocumentSize, 1)) }
 
     var gridColor: Color {
         get { StoredColor.decode(gridColorHex) ?? Color.gray.opacity(0.25) }
@@ -100,6 +107,7 @@ final class AppSettings: ObservableObject {
         gridSpacing = 50
         gridColorHex = "#80808040"
         borderColorHex = "#80808080"
+        newDocumentSize = Double(SVGLayerEditorViewModel.defaultDocumentSize)
     }
 
     func resetEditorSettings() {
@@ -118,6 +126,7 @@ private enum Keys {
     static let gridSpacing = "settings.preview.gridSpacing"
     static let gridColorHex = "settings.preview.gridColorHex"
     static let borderColorHex = "settings.preview.borderColorHex"
+    static let newDocumentSize = "settings.document.newSize"
     static let editorFontDesign = "settings.editor.fontDesign"
     static let editorFontSize = "settings.editor.fontSize"
     static let editorWrapLines = "settings.editor.wrapLines"

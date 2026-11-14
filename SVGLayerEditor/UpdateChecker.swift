@@ -48,7 +48,8 @@ enum UpdateChecker {
     }
 }
 
-private struct UpdateCheckResponse: Decodable {
+/// Decoded on URLSession's background queue, so it must not be main-actor isolated.
+private nonisolated struct UpdateCheckResponse: Decodable {
     let app: String?
     let currentVersion: String?
     let latestVersion: String?

@@ -14,16 +14,19 @@ Fully vibe coded / agentic coded using GPT-5.2-Codex.
 - Document XML editor with live re-parse and error banner.
 - Layer tree with selection, drag & drop reorder, indent/outdent, and delete.
 - Per-layer visibility toggle (hidden layers not rendered in preview).
-- Shapes: `rect`, `circle`, `ellipse`, `line`, `polygon`, `polyline`, `text`, and group `<g>`.
+- Shapes: `rect`, `circle`, `ellipse`, `line`, `polygon`, `polyline`, `path`, `text`, and group `<g>`.
+- Full SVG path syntax (`M L H V C S Q T A Z`, absolute and relative) for preview and editing.
+- Preview honours inherited paint from groups, `style` attributes, `<style>` CSS rules (class, id and element selectors), `transform`, `clip-path`, `fill-rule`, dashes and linear/radial gradients.
+- Export for Icon Composer: writes an `.icon` bundle with one SVG per layer and an `icon.json`.
 - Preserve fill/stroke defaults for new shapes.
 - Preview with grid and canvas border, zoom controls, fit-to-view, and selection outlines.
 - Mouse drag to move/resize selected elements (paths and basic shapes).
-- Rotate selected element in 15-degree steps.
+- Rotate selected element in 15-degree steps (rects, ellipses, text and groups get a `rotate()` transform instead of being distorted).
 - Align selected element to canvas center or to a reference element.
-- Undo/redo stack.
-- Open Recent menu.
+- Undo/redo stack (a whole drag or color-panel session is one undo step).
+- Open Recent menu (security-scoped bookmarks, so recent files reopen inside the App Sandbox).
 - File drop to open SVGs.
-- Unsaved changes indicator + close confirmation.
+- Unsaved changes indicator; Save / Don't Save / Cancel prompt on close, quit, New, Open and file drop.
 
 ## Requirements
 - macOS 26.0 or later
@@ -59,15 +62,31 @@ Alternatively, right-click the app in Finder and choose "Open".
 
 - The "Document XML" editor re-parses the entire SVG on change.
 - Parsing errors show as a red banner next to the editor.
-- Saving validates `width` and `height` on the root `<svg>`.
+- Saving requires a `viewBox` or `width` and `height` on the root `<svg>`. Units (`px`, `pt`, `mm`, …) and percentages are accepted.
+- Output follows the layout of Apple's icon assets: `xmlns` first, then identity, geometry and paint attributes in a fixed order, compact numbers (`550`, not `550.00`).
 
 ### Default New Document
 
+New documents use the Icon Composer canvas (size configurable in Settings → Preview):
+
 ```
 <?xml version="1.0" encoding="UTF-8"?>
-<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024"/>
 ```
+
+### Icon Composer
+
+Icon Composer places every layer image at its intrinsic size in points, centered on a 1024 × 1024 pt canvas. An SVG with `width="100" height="100"` therefore becomes a tiny 100 pt square in the icon. Design on a 1024 × 1024 canvas and leave out the background and the rounded-rect mask; Icon Composer supplies both.
+
+**File → Export for Icon Composer…** (`Cmd+Shift+E`) writes a `.icon` bundle you can open in Icon Composer or add to an Xcode project:
+
+- Each top-level `<g>` becomes a group; each of its children becomes a layer.
+- Every other top-level element becomes a group with a single layer.
+- The front-most (last) element is listed first in `icon.json`, as Icon Composer expects.
+- Every layer is written as its own SVG with `width="1024" height="1024"` and the document's viewBox (squared and centered), so layers keep their positions. Shared `<defs>`/`<style>` are copied into each layer, and the parent group's paint and transform are kept.
+- Hidden layers are skipped. Icon Composer works best with up to four groups.
+
+Text should be converted to outlines before the final export. Without a `font-family`, CoreSVG (which Icon Composer uses) falls back to Times; new text elements therefore get an explicit `font-family`.
 
 ### Layer Operations
 
@@ -83,15 +102,25 @@ Alternatively, right-click the app in Finder and choose "Open".
 - Save As: `Cmd+Shift+S`
 - Undo: `Cmd+Z`
 - Redo: `Cmd+Shift+Z`
-- Delete: `Delete`
+- Delete layer: `Cmd+Delete`
+- Export for Icon Composer: `Cmd+Shift+E`
 - Move Up/Down: `Cmd+Option+Up/Down`
 - Indent/Outdent: `Cmd+]` / `Cmd+[`
 - Insert from Clipboard: `Cmd+Shift+V`
 
+## Tests
+
+```bash
+Tests/run.sh
+```
+
+Compiles the model, parser, renderer, exporter and view model with a standalone test harness (no Xcode test target needed) and runs it.
+
 ## Notes
 
 - Save panels require the App Sandbox user-selected **read/write** entitlement.
-- Root SVG attributes (`width`, `height`, `viewBox`) are editable when the root is selected.
+- Root SVG attributes (`width`, `height`, `viewBox`) are editable when the root is selected; the root's Raw XML editor applies to the whole document.
+- Known limitations: XML comments, the original attribute order and text mixed with child elements (`<text>a<tspan>b</tspan></text>`) are not preserved; `<use>`, masks, filters and patterns are kept in the file but not drawn in the interactive preview.
 
 ---
 

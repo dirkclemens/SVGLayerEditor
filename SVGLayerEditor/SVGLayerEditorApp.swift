@@ -3,12 +3,23 @@
 //  SVGLayerEditor
 //
 
+import AppKit
 import SwiftUI
 import Combine
 import Foundation
 
+/// Asks about unsaved changes before the app quits (Cmd+Q, logout, restart).
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    var shouldTerminate: () -> Bool = { true }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        shouldTerminate() ? .terminateNow : .terminateCancel
+    }
+}
+
 @main
 struct SVGLayerEditorApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var viewModel = SVGLayerEditorViewModel()
     @StateObject private var settings = AppSettings()
 
@@ -22,8 +33,11 @@ struct SVGLayerEditorApp: App {
                 .environmentObject(viewModel)
                 .environmentObject(settings)
                 .onAppear {
+                    appDelegate.shouldTerminate = {
+                        viewModel.confirmDiscardChangesIfNeeded()
+                    }
                     if !viewModel.hasDocument {
-                        viewModel.createEmptyDocument()
+                        viewModel.createEmptyDocument(size: settings.newDocumentSizeValue)
                     }
                 }
         }
@@ -34,7 +48,7 @@ struct SVGLayerEditorApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("New") {
-                    viewModel.createEmptyDocument()
+                    viewModel.newDocument(size: settings.newDocumentSizeValue)
                 }
                 .keyboardShortcut("n", modifiers: .command)
                 Button("Open...") {
@@ -50,6 +64,12 @@ struct SVGLayerEditorApp: App {
                     viewModel.saveDocumentAs()
                 }
                 .keyboardShortcut("S", modifiers: [.command, .shift])
+                .disabled(!viewModel.hasDocument)
+                Divider()
+                Button("Export for Icon Composer...") {
+                    viewModel.exportIconComposer()
+                }
+                .keyboardShortcut("e", modifiers: [.command, .shift])
                 .disabled(!viewModel.hasDocument)
             }
 
@@ -85,10 +105,11 @@ struct SVGLayerEditorApp: App {
             }
 
             CommandMenu("Layer") {
+                // Cmd+Delete: a plain Delete shortcut would also fire while typing in the XML editors.
                 Button("Delete") {
                     viewModel.deleteSelection()
                 }
-                .keyboardShortcut(.delete, modifiers: [])
+                .keyboardShortcut(.delete, modifiers: [.command])
                 .disabled(viewModel.selectedNodeID == nil)
                 Divider()
                 Button("Move Up") {
@@ -105,7 +126,7 @@ struct SVGLayerEditorApp: App {
                     viewModel.indentSelection()
                 }
                 .keyboardShortcut("]", modifiers: [.command])
-                .disabled(viewModel.selectedNodeID == nil)
+                .disabled(!viewModel.canIndentSelection)
                 Button("Outdent") {
                     viewModel.outdentSelection()
                 }

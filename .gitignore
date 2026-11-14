@@ -3,3 +3,4 @@ images/
 *.dmg
 *.sh
 landing.html
+!Tests/run.sh
