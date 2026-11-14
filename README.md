@@ -23,9 +23,11 @@ Fully vibe coded / agentic coded using GPT-5.2-Codex.
 - Mouse drag to move/resize selected elements (paths and basic shapes).
 - Rotate selected element in 15-degree steps (rects, ellipses, text and groups get a `rotate()` transform instead of being distorted).
 - Align selected element to canvas center or to a reference element.
-- Undo/redo stack (a whole drag or color-panel session is one undo step).
+- Undo/redo through the standard Edit menu (a whole drag or color-panel session is one undo step). In the XML editors `Cmd+Z` undoes typing; elsewhere it undoes document changes.
+- Comments and the attribute order of opened files are preserved when saving.
 - Open Recent menu (security-scoped bookmarks, so recent files reopen inside the App Sandbox).
-- File drop to open SVGs.
+- File drop to open SVGs; the app also appears in Finder's "Open With" menu for SVG files.
+- Single-window editor: closing the window quits the app (after asking about unsaved changes).
 - Unsaved changes indicator; Save / Don't Save / Cancel prompt on close, quit, New, Open and file drop.
 
 ## Requirements
@@ -63,7 +65,8 @@ Alternatively, right-click the app in Finder and choose "Open".
 - The "Document XML" editor re-parses the entire SVG on change.
 - Parsing errors show as a red banner next to the editor.
 - Saving requires a `viewBox` or `width` and `height` on the root `<svg>`. Units (`px`, `pt`, `mm`, …) and percentages are accepted.
-- Output follows the layout of Apple's icon assets: `xmlns` first, then identity, geometry and paint attributes in a fixed order, compact numbers (`550`, not `550.00`).
+- Attributes keep their source order. Attributes of new elements (and attributes added later) follow the layout of Apple's icon assets: `xmlns` first, then identity, geometry and paint. Numbers are written compactly (`550`, not `550.00`).
+- Comments are kept and stay attached to the element that follows them.
 
 ### Default New Document
 
@@ -110,17 +113,17 @@ Text should be converted to outlines before the final export. Without a `font-fa
 
 ## Tests
 
-```bash
-Tests/run.sh
-```
+Unit tests live in the `SVGLayerEditorTests` target (XCTest, hosted in the app). Run them with `Cmd+U` in Xcode or:
 
-Compiles the model, parser, renderer, exporter and view model with a standalone test harness (no Xcode test target needed) and runs it.
+```bash
+xcodebuild -project SVGLayerEditor.xcodeproj -scheme SVGLayerEditor -destination 'platform=macOS,arch=arm64' test
+```
 
 ## Notes
 
 - Save panels require the App Sandbox user-selected **read/write** entitlement.
 - Root SVG attributes (`width`, `height`, `viewBox`) are editable when the root is selected; the root's Raw XML editor applies to the whole document.
-- Known limitations: XML comments, the original attribute order and text mixed with child elements (`<text>a<tspan>b</tspan></text>`) are not preserved; `<use>`, masks, filters and patterns are kept in the file but not drawn in the interactive preview.
+- Known limitations: text mixed with child elements (`<text>a<tspan>b</tspan></text>`), processing instructions and the DOCTYPE are not preserved; `<use>`, masks, filters and patterns are kept in the file but not drawn in the interactive preview.
 
 ---
 

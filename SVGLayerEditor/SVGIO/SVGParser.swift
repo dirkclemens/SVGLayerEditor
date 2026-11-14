@@ -24,12 +24,20 @@ enum SVGParseError: Error, LocalizedError {
     }
 }
 
+/// Reads SVG into `LayerNode`s.
+///
+/// `XMLDocument` is used because it keeps the attribute order and comments of the source.
+/// `XMLParser` serves as fallback for input libxml2's tree builder rejects (e.g. an undeclared
+/// `xlink:` prefix) and provides line/column information for error messages.
 final class SVGParser: NSObject, XMLParserDelegate {
     private var nodeStack: [LayerNode] = []
     private var rootNode: LayerNode?
     private var parseError: Error?
 
     static func parseDocument(from data: Data) throws -> SVGDocument {
+        if let document = try? parseWithXMLDocument(data) {
+            return document
+        }
         let parser = SVGParser()
         try parser.parse(data: data)
         guard let root = parser.rootNode else {
@@ -46,10 +54,72 @@ final class SVGParser: NSObject, XMLParserDelegate {
     }
 
     static func parseFragment(from string: String) throws -> [LayerNode] {
-        let wrapped = "<svg xmlns=\"http://www.w3.org/2000/svg\">\n\(string)\n</svg>"
+        let wrapped = "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\">\n\(string)\n</svg>"
         let document = try parseDocument(from: wrapped)
         return document.root.children
     }
+
+    // MARK: XMLDocument
+
+    private static func parseWithXMLDocument(_ data: Data) throws -> SVGDocument {
+        // Never resolve external entities (XXE).
+        let xml = try XMLDocument(data: data, options: [.nodeLoadExternalEntitiesNever])
+        guard let rootElement = xml.rootElement() else { throw SVGParseError.missingRoot }
+
+        var leading: [String] = []
+        var trailing: [String] = []
+        var seenRoot = false
+        for child in xml.children ?? [] {
+            if child === rootElement {
+                seenRoot = true
+            } else if child.kind == .comment {
+                if seenRoot { trailing.append(child.stringValue ?? "") } else { leading.append(child.stringValue ?? "") }
+            }
+        }
+        return SVGDocument(root: makeNode(rootElement), leadingComments: leading, trailingComments: trailing)
+    }
+
+    private static func makeNode(_ element: XMLElement) -> LayerNode {
+        var attributes: [String: String] = [:]
+        var order: [String] = []
+        // libxml2 reports namespace declarations separately; they are written first, as usual.
+        for namespace in element.namespaces ?? [] {
+            let prefix = namespace.name ?? ""
+            let key = prefix.isEmpty ? "xmlns" : "xmlns:\(prefix)"
+            if attributes[key] == nil { order.append(key) }
+            attributes[key] = namespace.stringValue ?? ""
+        }
+        for attribute in element.attributes ?? [] {
+            guard let name = attribute.name else { continue }
+            if attributes[name] == nil { order.append(name) }
+            attributes[name] = attribute.stringValue ?? ""
+        }
+
+        let node = LayerNode(elementName: element.name ?? "", attributes: attributes, attributeOrder: order)
+        var pendingComments: [String] = []
+        var text: String?
+        for child in element.children ?? [] {
+            switch child.kind {
+            case .element:
+                guard let childElement = child as? XMLElement else { continue }
+                let childNode = makeNode(childElement)
+                childNode.leadingComments = pendingComments
+                pendingComments = []
+                node.children.append(childNode)
+            case .comment:
+                pendingComments.append(child.stringValue ?? "")
+            case .text:
+                text = (text ?? "") + (child.stringValue ?? "")
+            default:
+                break
+            }
+        }
+        node.trailingComments = pendingComments
+        node.text = text
+        return node
+    }
+
+    // MARK: XMLParser fallback
 
     private func parse(data: Data) throws {
         let parser = XMLParser(data: data)

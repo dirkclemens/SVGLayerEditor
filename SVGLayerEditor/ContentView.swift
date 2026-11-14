@@ -10,6 +10,7 @@ import AppKit
 struct ContentView: View {
     @EnvironmentObject private var viewModel: SVGLayerEditorViewModel
     @EnvironmentObject private var settings: AppSettings
+    @Environment(\.undoManager) private var undoManager
     @State private var previewZoom: CGFloat = 1.0
     @State private var expandedNodes: Set<UUID> = []
     @State private var lastDocument: SVGDocument?
@@ -213,6 +214,9 @@ struct ContentView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text(viewModel.errorMessage ?? "Unknown error")
+        }
+        .onAppear {
+            viewModel.undoManager = undoManager
         }
         .onReceive(viewModel.$document) { newDoc in
             guard let newDoc else {

@@ -52,6 +52,9 @@ final class SVGLayerEditorViewModel: ObservableObject {
     private let serializer = SVGSerializer()
     private var isApplyingEditorUpdate = false
     private var isApplyingDocumentUpdate = false
+    private var isEditorSyncScheduled = false
+    /// The user already answered the unsaved-changes prompt when closing the window.
+    private var changesDiscardedForClose = false
 
     private var lastReferenceNodeID: UUID?
 
@@ -89,7 +92,8 @@ final class SVGLayerEditorViewModel: ObservableObject {
     var previewSVGData: Data? {
         guard let doc = document else { return nil }
         let filteredRoot = makeFilteredNode(from: doc.root)
-        let filteredDoc = SVGDocument(root: filteredRoot, sourceURL: doc.sourceURL, isDirty: doc.isDirty)
+        var filteredDoc = doc
+        filteredDoc.root = filteredRoot
         let svg = serializer.serialize(document: filteredDoc)
         return svg.data(using: String.Encoding.utf8)
     }
@@ -99,14 +103,7 @@ final class SVGLayerEditorViewModel: ObservableObject {
             if isHidden(child) { return nil }
             return makeFilteredNode(from: child)
         }
-        return LayerNode(
-            id: node.id,
-            name: node.name,
-            elementName: node.elementName,
-            attributes: node.attributes,
-            children: filteredChildren,
-            text: node.text
-        )
+        return node.withChildren(filteredChildren)
     }
 
     var selectedNodeXML: String? {
@@ -140,33 +137,65 @@ final class SVGLayerEditorViewModel: ObservableObject {
     }
 
     // MARK: Undo
+    //
+    // Snapshots live in undoStack/redoStack. Every step is mirrored into the window's
+    // UndoManager, so the standard Edit menu, the responder chain and the XML text views
+    // (which have their own UndoManager for typing) all behave like in other Mac apps.
+
+    /// The window's undo manager (set by ContentView).
+    weak var undoManager: UndoManager? {
+        didSet {
+            guard oldValue !== undoManager else { return }
+            oldValue?.removeAllActions(withTarget: self)
+            undoManager?.levelsOfUndo = maxUndoCount
+            // Steps recorded before the manager was known cannot be mirrored.
+            resetUndoStack()
+        }
+    }
 
     func undo() {
+        if let undoManager, undoManager.canUndo {
+            undoManager.undo()
+        } else {
+            performUndo()
+        }
+    }
+
+    func redo() {
+        if let undoManager, undoManager.canRedo {
+            undoManager.redo()
+        } else {
+            performRedo()
+        }
+    }
+
+    private func performUndo() {
         guard let snapshot = undoStack.popLast() else { return }
         undoCoalescingKey = nil
         if let doc = document {
-            redoStack.append(UndoSnapshot(
-                document: SVGDocument(root: doc.root.deepCopy(), sourceURL: doc.sourceURL, isDirty: doc.isDirty),
-                selectedNodeID: selectedNodeID
-            ))
+            redoStack.append(UndoSnapshot(document: doc.deepCopy(), selectedNodeID: selectedNodeID))
             if redoStack.count > maxUndoCount {
                 redoStack.removeFirst()
+            }
+            // Registered while undoing, so the UndoManager records it as the redo step.
+            undoManager?.registerUndo(withTarget: self) { viewModel in
+                viewModel.performRedo()
             }
         }
         document = snapshot.document
         selectedNodeID = snapshot.selectedNodeID
     }
 
-    func redo() {
+    private func performRedo() {
         guard let snapshot = redoStack.popLast() else { return }
         undoCoalescingKey = nil
         if let doc = document {
-            undoStack.append(UndoSnapshot(
-                document: SVGDocument(root: doc.root.deepCopy(), sourceURL: doc.sourceURL, isDirty: doc.isDirty),
-                selectedNodeID: selectedNodeID
-            ))
+            undoStack.append(UndoSnapshot(document: doc.deepCopy(), selectedNodeID: selectedNodeID))
             if undoStack.count > maxUndoCount {
                 undoStack.removeFirst()
+            }
+            undoManager?.registerUndo(withTarget: self) { viewModel in
+                viewModel.performUndo()
             }
         }
         document = snapshot.document
@@ -182,26 +211,31 @@ final class SVGLayerEditorViewModel: ObservableObject {
         undoCoalescingKey = coalescingKey
         undoCoalescingDate = now
 
-        let snapshot = UndoSnapshot(
-            document: SVGDocument(root: doc.root.deepCopy(), sourceURL: doc.sourceURL, isDirty: doc.isDirty),
-            selectedNodeID: selectedNodeID
-        )
-        undoStack.append(snapshot)
+        undoStack.append(UndoSnapshot(document: doc.deepCopy(), selectedNodeID: selectedNodeID))
         if undoStack.count > maxUndoCount {
             undoStack.removeFirst()
         }
         redoStack.removeAll()
+        undoManager?.registerUndo(withTarget: self) { viewModel in
+            viewModel.performUndo()
+        }
     }
 
     /// Ends a continuous edit (e.g. a drag), so the next one gets its own undo step.
     func endInteractiveChange() {
         undoCoalescingKey = nil
+        flushEditorSync()
+    }
+
+    private var isInteractiveChange: Bool {
+        undoCoalescingKey != nil && Date().timeIntervalSince(undoCoalescingDate) < 2
     }
 
     private func resetUndoStack() {
         undoStack = []
         redoStack = []
         undoCoalescingKey = nil
+        undoManager?.removeAllActions(withTarget: self)
     }
 
     // MARK: XML editors
@@ -220,15 +254,7 @@ final class SVGLayerEditorViewModel: ObservableObject {
                     return
                 }
                 pushUndoSnapshot(for: doc)
-                let newRoot = parsed.root
-                doc.root = LayerNode(
-                    id: selectedID,
-                    name: newRoot.name,
-                    elementName: newRoot.elementName,
-                    attributes: newRoot.attributes,
-                    children: newRoot.children,
-                    text: newRoot.text
-                )
+                doc.root = parsed.root.withID(selectedID)
                 selectedNodeXMLError = nil
                 doc.isDirty = true
                 document = doc
@@ -252,14 +278,7 @@ final class SVGLayerEditorViewModel: ObservableObject {
             }
 
             pushUndoSnapshot(for: doc)
-            let newNode = LayerNode(
-                id: selectedID,
-                name: parsedNode.name,
-                elementName: parsedNode.elementName,
-                attributes: parsedNode.attributes,
-                children: parsedNode.children,
-                text: parsedNode.text
-            )
+            let newNode = parsedNode.withID(selectedID)
             selectedNodeXMLError = nil
             parent.children[index] = newNode
             doc.isDirty = true
@@ -294,10 +313,13 @@ final class SVGLayerEditorViewModel: ObservableObject {
     }
 
     func applyDocumentXMLFromEditor() {
+        // A pending refresh means the editor shows an outdated document; applying it would revert changes.
+        guard !isEditorSyncScheduled else { flushEditorSync(); return }
         applyDocumentXMLText(documentXMLText)
     }
 
     func applySelectedNodeXMLFromEditor() {
+        guard !isEditorSyncScheduled else { flushEditorSync(); return }
         applySelectedNodeXMLText(selectedNodeXMLText)
     }
 
@@ -305,7 +327,7 @@ final class SVGLayerEditorViewModel: ObservableObject {
 
     /// Asks before unsaved changes would be lost. Returns false if the user cancels.
     func confirmDiscardChangesIfNeeded() -> Bool {
-        guard isDirty else { return true }
+        guard isDirty, !changesDiscardedForClose else { return true }
         let alert = NSAlert()
         alert.messageText = "Do you want to save the changes made to \u{201C}\(documentDisplayName)\u{201D}?"
         alert.informativeText = "Your changes will be lost if you don't save them."
@@ -325,12 +347,10 @@ final class SVGLayerEditorViewModel: ObservableObject {
         }
     }
 
-    /// Window close: ask, and drop the discarded document so quitting does not ask again.
+    /// Window close. Closing the window quits the app, so the answer also covers termination.
     func confirmCloseIfNeeded() -> Bool {
         guard confirmDiscardChangesIfNeeded() else { return false }
-        DispatchQueue.main.async { [weak self] in
-            self?.closeDocument()
-        }
+        changesDiscardedForClose = true
         return true
     }
 
@@ -605,14 +625,6 @@ final class SVGLayerEditorViewModel: ObservableObject {
         resetUndoStack()
     }
 
-    private func closeDocument() {
-        replaceSecurityScope(with: nil)
-        document = nil
-        selectedNodeID = nil
-        lastReferenceNodeID = nil
-        resetUndoStack()
-    }
-
     private func moveSelection(by offset: Int) {
         guard var doc = document, let selectedID = selectedNodeID else { return }
         guard let parent = doc.root.findParent(of: selectedID),
@@ -824,6 +836,39 @@ extension SVGLayerEditorViewModel {
     }
 
     func syncSelectedNodeText() {
+        if scheduleEditorSyncIfInteractive() { return }
+        performSelectedNodeTextSync()
+    }
+
+    func syncDocumentText() {
+        if scheduleEditorSyncIfInteractive() { return }
+        performDocumentTextSync()
+    }
+
+    /// During drags and color-panel changes the document changes many times per second.
+    /// Re-serializing it into the editors each time is expensive for large files, so the
+    /// editors are refreshed at most every 0.25 s and once more when the change ends.
+    private func scheduleEditorSyncIfInteractive() -> Bool {
+        guard isInteractiveChange else { return false }
+        if !isEditorSyncScheduled {
+            isEditorSyncScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                guard let self, self.isEditorSyncScheduled else { return }
+                self.flushEditorSync()
+            }
+        }
+        return true
+    }
+
+    /// Brings both XML editors up to date immediately if a refresh is pending.
+    func flushEditorSync() {
+        guard isEditorSyncScheduled else { return }
+        isEditorSyncScheduled = false
+        performDocumentTextSync()
+        performSelectedNodeTextSync()
+    }
+
+    private func performSelectedNodeTextSync() {
         guard let xml = selectedNodeXML else {
             if !selectedNodeXMLText.isEmpty || selectedNodeXMLError != nil {
                 selectedNodeXMLText = ""
@@ -842,7 +887,7 @@ extension SVGLayerEditorViewModel {
         }
     }
 
-    func syncDocumentText() {
+    private func performDocumentTextSync() {
         guard let doc = document else {
             if !documentXMLText.isEmpty || documentXMLError != nil {
                 documentXMLText = ""

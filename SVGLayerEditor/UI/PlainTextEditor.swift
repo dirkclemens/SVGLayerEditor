@@ -60,6 +60,7 @@ struct PlainTextEditor: NSViewRepresentable {
         textView.isEditable = true
         textView.isSelectable = true
         textView.isRichText = false
+        textView.allowsUndo = true
         textView.string = text
         textView.delegate = context.coordinator
         textView.usesAdaptiveColorMappingForDarkAppearance = true
@@ -114,15 +115,27 @@ struct PlainTextEditor: NSViewRepresentable {
         weak var textView: NSTextView?
         private var isProgrammaticUpdate = false
         private var text: Binding<String>
+        /// Typing has its own undo history; Cmd+Z in the editor undoes text, not document edits.
+        private let textUndoManager = UndoManager()
 
         init(text: Binding<String>) {
             self.text = text
         }
 
+        func undoManager(for view: NSTextView) -> UndoManager? {
+            textUndoManager
+        }
+
         func setTextIfNeeded(_ newText: String) {
-            guard textView?.string != newText else { return }
+            guard let textView, textView.string != newText else { return }
             isProgrammaticUpdate = true
-            textView?.string = newText
+            // Keep the cursor where it was as far as possible.
+            let selection = textView.selectedRange()
+            textView.string = newText
+            let length = (newText as NSString).length
+            textView.setSelectedRange(NSRange(location: min(selection.location, length), length: 0))
+            // The text was replaced from outside; old typing steps no longer apply to it.
+            textUndoManager.removeAllActions()
             isProgrammaticUpdate = false
         }
 
