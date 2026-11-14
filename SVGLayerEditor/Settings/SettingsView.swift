@@ -35,6 +35,20 @@ struct SettingsView: View {
                 valueSlider(value: $settings.gridSpacing, range: 0...200, step: 5, fractionDigits: 0)
             }
 
+            LabeledContent("New Document Size") {
+                HStack {
+                    TextField("Size", value: $settings.newDocumentSize, format: .number.precision(.fractionLength(0)))
+                        .frame(width: 70)
+                        .multilineTextAlignment(.trailing)
+                    Text("× \(settings.newDocumentSize.formatted(.number.precision(.fractionLength(0))))")
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Icon Composer (1024)") {
+                        settings.newDocumentSize = Double(SVGLayerEditorViewModel.defaultDocumentSize)
+                    }
+                }
+            }
+
             ColorPicker(
                 "Grid Color",
                 selection: Binding(

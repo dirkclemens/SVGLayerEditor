@@ -10,6 +10,7 @@ import AppKit
 struct ContentView: View {
     @EnvironmentObject private var viewModel: SVGLayerEditorViewModel
     @EnvironmentObject private var settings: AppSettings
+    @Environment(\.undoManager) private var undoManager
     @State private var previewZoom: CGFloat = 1.0
     @State private var expandedNodes: Set<UUID> = []
     @State private var lastDocument: SVGDocument?
@@ -35,6 +36,12 @@ struct ContentView: View {
                 }
                 .help("Save")
                 .disabled(!viewModel.hasDocument)
+
+                Button { viewModel.exportIconComposer() } label: {
+                    Image(systemName: "square.and.arrow.up")
+                }
+                .help("Export for Icon Composer")
+                .disabled(!viewModel.hasDocument)
                 
                 Button { viewModel.undo() } label: {
                     Image(systemName: "arrow.uturn.backward")
@@ -51,7 +58,7 @@ struct ContentView: View {
             
             ToolbarItemGroup(placement: .automatic) {
                 Button { viewModel.addGroup() } label: {
-                    Image(systemName: "folder")
+                    Image(systemName: "folder.badge.plus")
                 }
                 .help("Add Group")
                 .disabled(!viewModel.hasDocument)
@@ -203,10 +210,13 @@ struct ContentView: View {
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             handleFileDrop(providers)
         }
-        .alert("Error", isPresented: $viewModel.isShowingError) {
+        .alert(viewModel.alertTitle, isPresented: $viewModel.isShowingError) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(viewModel.errorMessage ?? "Unknown error")
+        }
+        .onAppear {
+            viewModel.undoManager = undoManager
         }
         .onReceive(viewModel.$document) { newDoc in
             guard let newDoc else {
@@ -396,8 +406,8 @@ struct ContentView: View {
             } label: {
                 Image(systemName: "arrow.right.to.line")
             }
-            .help("Indent")
-            .disabled(!hasSelection)
+            .help("Move into the group above")
+            .disabled(!viewModel.canIndentSelection)
 
             Button {
                 viewModel.outdentSelection()
@@ -427,11 +437,10 @@ struct ContentView: View {
 
     private var previewPanel: some View {
         Group {
-            let paths = viewModel.previewPaths
-            if !paths.isEmpty {
+            if let scene = viewModel.previewScene, !scene.items.isEmpty {
                 SVGPreviewImageView(
                     viewBox: viewModel.previewViewBox,
-                    paths: paths,
+                    scene: scene,
                     scale: previewZoom,
                     selectedID: viewModel.selectedNodeID,
                     moveSensitivity: settings.moveSensitivityValue,
@@ -441,7 +450,10 @@ struct ContentView: View {
                     borderColor: settings.borderColor,
                     onSelect: { viewModel.selectedNodeID = $0 },
                     onTransform: { id, transform in
-                        viewModel.transformElement(nodeID: id, transform: transform)
+                        viewModel.transformElement(nodeID: id, transform: transform, coalescingKey: "drag:\(id)")
+                    },
+                    onTransformEnded: {
+                        viewModel.endInteractiveChange()
                     }
                 )
                 .frame(minHeight: 240)

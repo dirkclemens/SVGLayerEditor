@@ -3,7 +3,7 @@ import AppKit
 
 struct SVGPreviewImageView: View {
     let viewBox: CGRect
-    let paths: [SVGLayerEditorViewModel.SVGPreviewPath]
+    let scene: SVGRenderScene
     let scale: CGFloat
     let selectedID: UUID?
     let moveSensitivity: CGFloat
@@ -12,62 +12,42 @@ struct SVGPreviewImageView: View {
     let gridColor: Color
     let borderColor: Color
     let onSelect: (UUID?) -> Void
+    /// Transform in canvas (viewBox) coordinates for the given element.
     let onTransform: (UUID, CGAffineTransform) -> Void
+    let onTransformEnded: () -> Void
 
-    private let parser = SVGPathParser()
     @State private var dragMode: DragMode?
 
     var body: some View {
         GeometryReader { geo in
-            let parsed: [(SVGLayerEditorViewModel.SVGPreviewPath, CGPath?)] = paths.map { item in
-                (item, buildPath(for: item))
-            }
-            let effective = effectiveViewBox(fallback: viewBox, paths: parsed.compactMap { $0.1 })
+            let effective = effectiveViewBox()
             let transform = viewBoxTransform(viewBox: effective, size: geo.size, scale: scale)
+            let fit = transform.a
             let inverse = transform.inverted()
-            let selectedPath = parsed.first { $0.0.id == selectedID }
-            let selectedBoundsSVG = selectedPath?.1?.boundingBoxOfPath
+            let selectedBoundsSVG = selectedID.flatMap { scene.boundsByID[$0] }
             let selectedBoundsView = selectedBoundsSVG.map { $0.applying(transform) }
 
             ZStack {
                 Canvas { context, _ in
                     context.concatenate(transform)
+                    drawGrid(in: context, viewBox: effective, lineWidth: 0.5 / fit)
 
-                    drawGrid(in: context, viewBox: effective)
-
-                    for (pathElement, cgPath) in parsed {
-                        context.opacity = pathElement.opacity ?? 1.0
-
-                        if pathElement.elementName == "text",
-                           let textValue = pathElement.text,
-                           let x = number(pathElement.attributes["x"]),
-                           let y = number(pathElement.attributes["y"]) {
-                            let fontSize = SVGTextMetrics.resolvedFontSize(attributes: pathElement.attributes)
-                            let textColor = Color(svg: pathElement.fill ?? "black") ?? .black
-                            let text = Text(textValue).font(.system(size: fontSize))
-                            context.draw(text.foregroundStyle(textColor), at: CGPoint(x: x, y: y), anchor: .topLeading)
-                            continue
-                        }
-
-                        guard let cgPath else { continue }
-
-                        if let fill = pathElement.fill, fill.lowercased() != "none", let color = Color(svg: fill) {
-                            context.fill(Path(cgPath), with: .color(color))
-                        }
-
-                        if let stroke = pathElement.stroke, stroke.lowercased() != "none", let color = Color(svg: stroke) {
-                            let strokeWidth = number(pathElement.attributes["stroke-width"]) ?? 1
-                            let strokeStyle = StrokeStyle(lineWidth: strokeWidth)
-                            context.stroke(Path(cgPath), with: .color(color), style: strokeStyle)
-                        }
-
-                        if pathElement.id == selectedID {
-                            let highlight = StrokeStyle(lineWidth: 2, dash: [6, 3])
-                            context.stroke(Path(cgPath), with: .color(.accentColor), style: highlight)
-                        }
+                    for item in scene.items {
+                        draw(item, in: context)
                     }
 
-                    drawBorder(in: context, viewBox: effective)
+                    if let selectedID, let item = scene.items.first(where: { $0.id == selectedID }) {
+                        var highlight = context
+                        highlight.concatenate(item.transform)
+                        let unit = 1 / max(fit * Self.scaleFactor(of: item.transform), 0.0001)
+                        highlight.stroke(
+                            Path(item.path),
+                            with: .color(.accentColor),
+                            style: StrokeStyle(lineWidth: 2 * unit, dash: [6 * unit, 3 * unit])
+                        )
+                    }
+
+                    drawBorder(in: context, viewBox: effective, lineWidth: 1 / fit)
                 }
 
                 if let bounds = selectedBoundsView {
@@ -77,12 +57,11 @@ struct SVGPreviewImageView: View {
                     .stroke(Color.accentColor.opacity(0.7), style: StrokeStyle(lineWidth: 1, dash: [4, 2]))
 
                     ForEach(Handle.allCases, id: \.self) { handle in
-                        let handlePoint = handle.point(in: bounds)
                         Circle()
                             .fill(Color.white)
                             .overlay(Circle().stroke(Color.accentColor, lineWidth: 1))
                             .frame(width: 10, height: 10)
-                            .position(handlePoint)
+                            .position(handle.point(in: bounds))
                     }
                 }
             }
@@ -90,19 +69,12 @@ struct SVGPreviewImageView: View {
             .gesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { value in
-                        guard let selectedID else { return }
                         let viewPoint = value.location
                         let svgPoint = viewPoint.applying(inverse)
 
                         if dragMode == nil {
-                            if let boundsView = selectedBoundsView, let handle = hitHandle(at: viewPoint, in: boundsView) {
-                                dragMode = .resize(handle: handle, startBounds: selectedBoundsSVG ?? .zero, startPoint: svgPoint)
-                            } else if let hit = hitTest(svgPoint: svgPoint, paths: parsed) {
-                                onSelect(hit)
-                                dragMode = .move(startPoint: svgPoint)
-                            } else {
-                                onSelect(nil)
-                            }
+                            dragMode = beginDrag(viewPoint: viewPoint, svgPoint: svgPoint, fit: fit,
+                                                 selectedBoundsSVG: selectedBoundsSVG, selectedBoundsView: selectedBoundsView)
                         }
 
                         let modifiers = NSEvent.modifierFlags
@@ -110,124 +82,193 @@ struct SVGPreviewImageView: View {
                         let centerScale = modifiers.contains(.option)
 
                         switch dragMode {
-                        case .move(let startPoint):
-                            let rawDelta = CGPoint(x: svgPoint.x - startPoint.x, y: svgPoint.y - startPoint.y)
-                            let delta = CGPoint(x: rawDelta.x * moveSensitivity, y: rawDelta.y * moveSensitivity)
-                            let transform = CGAffineTransform(translationX: delta.x, y: delta.y)
-                            onTransform(selectedID, transform)
-                            let nextPoint = CGPoint(x: startPoint.x + delta.x, y: startPoint.y + delta.y)
-                            dragMode = .move(startPoint: nextPoint)
-                        case .resize(let handle, let startBounds, let startPoint):
-                            let rawDelta = CGPoint(x: svgPoint.x - startPoint.x, y: svgPoint.y - startPoint.y)
-                            let adjustedPoint = CGPoint(x: startPoint.x + rawDelta.x * resizeSensitivity, y: startPoint.y + rawDelta.y * resizeSensitivity)
-                            let newBounds = resizedBounds(from: startBounds, to: adjustedPoint, handle: handle, keepAspect: keepAspect, centerScale: centerScale)
-                            if let transform = resizeTransform(from: startBounds, to: newBounds, handle: handle, centerScale: centerScale) {
-                                onTransform(selectedID, transform)
-                            }
-                        case .none:
+                        case .move(let id, let lastPoint):
+                            let delta = CGPoint(x: (svgPoint.x - lastPoint.x) * moveSensitivity,
+                                                y: (svgPoint.y - lastPoint.y) * moveSensitivity)
+                            guard delta != .zero else { return }
+                            onTransform(id, CGAffineTransform(translationX: delta.x, y: delta.y))
+                            dragMode = .move(id: id, lastPoint: CGPoint(x: lastPoint.x + delta.x, y: lastPoint.y + delta.y))
+                        case .resize(let id, let handle, let startBounds, let startPoint, let currentBounds):
+                            let adjustedPoint = CGPoint(x: startPoint.x + (svgPoint.x - startPoint.x) * resizeSensitivity,
+                                                        y: startPoint.y + (svgPoint.y - startPoint.y) * resizeSensitivity)
+                            let newBounds = resizedBounds(from: startBounds, to: adjustedPoint, handle: handle,
+                                                          keepAspect: keepAspect, centerScale: centerScale)
+                            guard newBounds != currentBounds else { return }
+                            // Each event applies only the change since the previous event.
+                            onTransform(id, rectTransform(from: currentBounds, to: newBounds))
+                            dragMode = .resize(id: id, handle: handle, startBounds: startBounds,
+                                               startPoint: startPoint, currentBounds: newBounds)
+                        case .idle?, nil:
                             break
                         }
                     }
                     .onEnded { _ in
+                        switch dragMode {
+                        case .move?, .resize?:
+                            onTransformEnded()
+                        case .idle?, nil:
+                            break
+                        }
                         dragMode = nil
                     }
             )
         }
     }
 
-    private func buildPath(for item: SVGLayerEditorViewModel.SVGPreviewPath) -> CGPath? {
-        switch item.elementName {
-        case "path":
-            guard let d = item.d else { return nil }
-            return parser.parse(d)
-        case "rect":
-            guard let x = number(item.attributes["x"]),
-                  let y = number(item.attributes["y"]),
-                  let w = number(item.attributes["width"]),
-                  let h = number(item.attributes["height"]) else { return nil }
-            let rect = CGRect(x: x, y: y, width: w, height: h)
-            let rx = number(item.attributes["rx"]) ?? 0
-            let ry = number(item.attributes["ry"]) ?? 0
-            if rx > 0 || ry > 0 {
-                let cornerWidth = min(rx, w / 2)
-                let cornerHeight = min(ry, h / 2)
-                return CGPath(roundedRect: rect, cornerWidth: cornerWidth, cornerHeight: cornerHeight, transform: nil)
+    private func beginDrag(viewPoint: CGPoint, svgPoint: CGPoint, fit: CGFloat,
+                           selectedBoundsSVG: CGRect?, selectedBoundsView: CGRect?) -> DragMode {
+        if let selectedID, let boundsView = selectedBoundsView, let boundsSVG = selectedBoundsSVG,
+           let handle = hitHandle(at: viewPoint, in: boundsView) {
+            return .resize(id: selectedID, handle: handle, startBounds: boundsSVG, startPoint: svgPoint, currentBounds: boundsSVG)
+        }
+        guard let hit = hitTest(canvasPoint: svgPoint, fit: fit) else {
+            onSelect(nil)
+            return .idle
+        }
+        // Keep a selected group (from the layer list) when clicking its content, so it can be dragged as a whole.
+        if let selectedID, hit.id == selectedID || (hit.ancestorIDs.contains(selectedID) && hit.ancestorIDs.first != selectedID) {
+            return .move(id: selectedID, lastPoint: svgPoint)
+        }
+        onSelect(hit.id)
+        return .move(id: hit.id, lastPoint: svgPoint)
+    }
+
+    // MARK: Drawing
+
+    private func draw(_ item: SVGRenderItem, in base: GraphicsContext) {
+        var context = base
+        for clip in item.clipPaths {
+            context.clip(to: Path(clip))
+        }
+        context.concatenate(item.transform)
+        context.opacity = item.opacity
+
+        if let text = item.text {
+            guard !item.fill.isNone, !text.string.isEmpty else { return }
+            let font = SVGTextMetrics.font(properties: text.properties)
+            let color: Color
+            switch item.fill {
+            case .color(var value):
+                value.alpha *= item.fillOpacity
+                color = value.swiftUIColor
+            case .gradient(let gradient):
+                color = gradient.stops.first?.color.swiftUIColor ?? .black
+            case .none:
+                return
             }
-            return CGPath(rect: rect, transform: nil)
-        case "circle":
-            guard let cx = number(item.attributes["cx"]),
-                  let cy = number(item.attributes["cy"]),
-                  let r = number(item.attributes["r"]) else { return nil }
-            let rect = CGRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2)
-            return CGPath(ellipseIn: rect, transform: nil)
-        case "ellipse":
-            guard let cx = number(item.attributes["cx"]),
-                  let cy = number(item.attributes["cy"]),
-                  let rx = number(item.attributes["rx"]),
-                  let ry = number(item.attributes["ry"]) else { return nil }
-            let rect = CGRect(x: cx - rx, y: cy - ry, width: rx * 2, height: ry * 2)
-            return CGPath(ellipseIn: rect, transform: nil)
-        case "line":
-            guard let x1 = number(item.attributes["x1"]),
-                  let y1 = number(item.attributes["y1"]),
-                  let x2 = number(item.attributes["x2"]),
-                  let y2 = number(item.attributes["y2"]) else { return nil }
-            let path = CGMutablePath()
-            path.move(to: CGPoint(x: x1, y: y1))
-            path.addLine(to: CGPoint(x: x2, y: y2))
-            return path
-        case "polygon":
-            guard let points = item.attributes["points"], let list = parsePoints(points), !list.isEmpty else { return nil }
-            let path = CGMutablePath()
-            path.move(to: list[0])
-            for point in list.dropFirst() { path.addLine(to: point) }
-            path.closeSubpath()
-            return path
-        case "polyline":
-            guard let points = item.attributes["points"], let list = parsePoints(points), !list.isEmpty else { return nil }
-            let path = CGMutablePath()
-            path.move(to: list[0])
-            for point in list.dropFirst() { path.addLine(to: point) }
-            return path
-        case "text":
-            guard let bounds = SVGTextMetrics.bounds(attributes: item.attributes, text: item.text) else { return nil }
-            return CGPath(rect: bounds, transform: nil)
-        default:
-            return nil
+            context.draw(Text(text.string).font(Font(font as CTFont)).foregroundStyle(color), at: text.origin, anchor: .topLeading)
+            return
+        }
+
+        let bounds = item.path.boundingBoxOfPath
+        fill(item.path, paint: item.fill, opacity: item.fillOpacity, evenOdd: item.evenOdd, objectBounds: bounds, in: context)
+        if !item.stroke.isNone, let outline = item.strokeOutline() {
+            fill(outline, paint: item.stroke, opacity: item.strokeOpacity, evenOdd: false, objectBounds: bounds, in: context)
         }
     }
 
-    private func parsePoints(_ value: String) -> [CGPoint]? {
-        let parts = value
-            .split { $0 == " " || $0 == "," || $0 == "\n" || $0 == "\t" }
-            .map(String.init)
-        if parts.count < 2 { return nil }
-        var points: [CGPoint] = []
-        var index = 0
-        while index + 1 < parts.count {
-            if let x = Double(parts[index]), let y = Double(parts[index + 1]) {
-                points.append(CGPoint(x: x, y: y))
+    private func fill(_ path: CGPath, paint: SVGPaint, opacity: Double, evenOdd: Bool,
+                      objectBounds: CGRect, in base: GraphicsContext) {
+        let style = FillStyle(eoFill: evenOdd)
+        switch paint {
+        case .none:
+            return
+        case .color(var color):
+            color.alpha *= opacity
+            base.fill(Path(path), with: .color(color.swiftUIColor), style: style)
+        case .gradient(let gradient):
+            var space = gradient.transform
+            if gradient.usesObjectBoundingBox {
+                guard objectBounds.width > 0, objectBounds.height > 0 else {
+                    if var first = gradient.stops.first?.color {
+                        first.alpha *= opacity
+                        base.fill(Path(path), with: .color(first.swiftUIColor), style: style)
+                    }
+                    return
+                }
+                space = space.concatenating(CGAffineTransform(
+                    a: objectBounds.width, b: 0, c: 0, d: objectBounds.height,
+                    tx: objectBounds.minX, ty: objectBounds.minY
+                ))
             }
-            index += 2
+            guard abs(space.a * space.d - space.b * space.c) > 1e-12 else { return }
+            var context = base
+            context.clip(to: Path(path), style: style)
+            context.concatenate(space)
+            let area = path.boundingBoxOfPath.applying(space.inverted()).insetBy(dx: -1, dy: -1)
+            let stops = gradient.stops.map { stop -> Gradient.Stop in
+                var color = stop.color
+                color.alpha *= opacity
+                return Gradient.Stop(color: color.swiftUIColor, location: stop.offset)
+            }
+            let shading: GraphicsContext.Shading
+            switch gradient.kind {
+            case .linear(let start, let end):
+                shading = .linearGradient(Gradient(stops: stops), startPoint: start, endPoint: end)
+            case .radial(let center, let radius):
+                shading = .radialGradient(Gradient(stops: stops), center: center, startRadius: 0, endRadius: radius)
+            }
+            context.fill(Path(area), with: shading)
         }
-        return points.isEmpty ? nil : points
     }
 
-    private func number(_ value: String?) -> CGFloat? {
-        guard let value else { return nil }
-        return CGFloat(Double(value) ?? .nan).isNaN ? nil : CGFloat(Double(value) ?? 0)
+    private func drawGrid(in context: GraphicsContext, viewBox: CGRect, lineWidth: CGFloat) {
+        guard gridSpacing > 0 else { return }
+        var path = Path()
+        var x = (viewBox.minX / gridSpacing).rounded(.up) * gridSpacing
+        while x <= viewBox.maxX {
+            path.move(to: CGPoint(x: x, y: viewBox.minY))
+            path.addLine(to: CGPoint(x: x, y: viewBox.maxY))
+            x += gridSpacing
+        }
+        var y = (viewBox.minY / gridSpacing).rounded(.up) * gridSpacing
+        while y <= viewBox.maxY {
+            path.move(to: CGPoint(x: viewBox.minX, y: y))
+            path.addLine(to: CGPoint(x: viewBox.maxX, y: y))
+            y += gridSpacing
+        }
+        context.stroke(path, with: .color(gridColor), lineWidth: lineWidth)
     }
 
-    private func hitTest(svgPoint: CGPoint, paths: [(SVGLayerEditorViewModel.SVGPreviewPath, CGPath?)]) -> UUID? {
-        for (item, path) in paths.reversed() {
-            if let path, path.contains(svgPoint) {
-                return item.id
+    private func drawBorder(in context: GraphicsContext, viewBox: CGRect, lineWidth: CGFloat) {
+        context.stroke(Path(viewBox), with: .color(borderColor), lineWidth: lineWidth)
+    }
+
+    // MARK: Geometry
+
+    private func effectiveViewBox() -> CGRect {
+        let defaultBox = CGRect(x: 0, y: 0, width: 100, height: 100)
+        guard viewBox == defaultBox else { return viewBox }
+        let content = scene.items.reduce(CGRect.null) { $0.union($1.canvasBounds) }
+        return content.isNull || content.isEmpty ? viewBox : content
+    }
+
+    private func viewBoxTransform(viewBox: CGRect, size: CGSize, scale: CGFloat) -> CGAffineTransform {
+        let sx = size.width / max(viewBox.width, 1)
+        let sy = size.height / max(viewBox.height, 1)
+        let fit = max(min(sx, sy) * scale, 0.0001)
+        let tx = (size.width - viewBox.width * fit) / 2.0 - viewBox.minX * fit
+        let ty = (size.height - viewBox.height * fit) / 2.0 - viewBox.minY * fit
+        return CGAffineTransform(translationX: tx, y: ty).scaledBy(x: fit, y: fit)
+    }
+
+    private static func scaleFactor(of transform: CGAffineTransform) -> CGFloat {
+        sqrt(abs(transform.a * transform.d - transform.b * transform.c))
+    }
+
+    private func hitTest(canvasPoint: CGPoint, fit: CGFloat) -> SVGRenderItem? {
+        for item in scene.items.reversed() {
+            let scale = Self.scaleFactor(of: item.transform)
+            guard scale > 1e-9, !item.isClipped(canvasPoint: canvasPoint) else { continue }
+            let local = canvasPoint.applying(item.transform.inverted())
+            if item.text != nil || !item.fill.isNone,
+               item.path.contains(local, using: item.evenOdd ? .evenOdd : .winding) {
+                return item
             }
-            if item.elementName == "line", let path {
-                let width = number(item.attributes["stroke-width"]) ?? 6
-                let stroked = path.copy(strokingWithWidth: width, lineCap: .round, lineJoin: .round, miterLimit: 1)
-                if stroked.contains(svgPoint) {
-                    return item.id
+            if !item.stroke.isNone || item.fill.isNone {
+                let tolerance = 8 / max(fit * scale, 0.0001)
+                if let outline = item.strokeOutline(minimumWidth: tolerance), outline.contains(local) {
+                    return item
                 }
             }
         }
@@ -266,6 +307,7 @@ struct SVGPreviewImageView: View {
         proposed.size.width = max(proposed.width, minSize)
         proposed.size.height = max(proposed.height, minSize)
 
+        let anchor = handle.anchorPoint(in: start)
         if keepAspect {
             let widthBasedHeight = proposed.width / aspect
             let heightBasedWidth = proposed.height * aspect
@@ -275,170 +317,37 @@ struct SVGPreviewImageView: View {
             } else {
                 proposed.size.width = max(heightBasedWidth, minSize)
             }
-
-            let anchor = handle.anchorPoint(in: start)
-            switch handle {
-            case .topLeft:
-                proposed.origin = CGPoint(x: anchor.x - proposed.width, y: anchor.y - proposed.height)
-            case .topRight:
-                proposed.origin = CGPoint(x: anchor.x, y: anchor.y - proposed.height)
-            case .bottomLeft:
-                proposed.origin = CGPoint(x: anchor.x - proposed.width, y: anchor.y)
-            case .bottomRight:
-                proposed.origin = CGPoint(x: anchor.x, y: anchor.y)
-            }
         }
 
+        // Keep the opposite corner fixed.
+        switch handle {
+        case .topLeft:
+            proposed.origin = CGPoint(x: anchor.x - proposed.width, y: anchor.y - proposed.height)
+        case .topRight:
+            proposed.origin = CGPoint(x: anchor.x, y: anchor.y - proposed.height)
+        case .bottomLeft:
+            proposed.origin = CGPoint(x: anchor.x - proposed.width, y: anchor.y)
+        case .bottomRight:
+            proposed.origin = anchor
+        }
         return proposed
     }
 
-    private func resizeTransform(from start: CGRect, to end: CGRect, handle: Handle, centerScale: Bool) -> CGAffineTransform? {
-        let startWidth = max(start.width, 1)
-        let startHeight = max(start.height, 1)
-        let endWidth = max(end.width, 1)
-        let endHeight = max(end.height, 1)
-        let sx = endWidth / startWidth
-        let sy = endHeight / startHeight
-
-        let anchor: CGPoint
-        if centerScale {
-            anchor = CGPoint(x: start.midX, y: start.midY)
-        } else {
-            anchor = handle.anchorPoint(in: start)
-        }
-
-        var transform = CGAffineTransform(translationX: anchor.x, y: anchor.y)
-        transform = transform.scaledBy(x: sx, y: sy)
-        transform = transform.translatedBy(x: -anchor.x, y: -anchor.y)
-        return transform
-    }
-
-    private func viewBoxTransform(viewBox: CGRect, size: CGSize, scale: CGFloat) -> CGAffineTransform {
-        let sx = size.width / max(viewBox.width, 1)
-        let sy = size.height / max(viewBox.height, 1)
-        let fit = min(sx, sy) * scale
-        let tx = (size.width - viewBox.width * fit) / 2.0 - viewBox.minX * fit
-        let ty = (size.height - viewBox.height * fit) / 2.0 - viewBox.minY * fit
-        return CGAffineTransform(translationX: tx, y: ty).scaledBy(x: fit, y: fit)
-    }
-
-    private func effectiveViewBox(fallback: CGRect, paths: [CGPath]) -> CGRect {
-        let defaultBox = CGRect(x: 0, y: 0, width: 100, height: 100)
-        var bounds: CGRect = .null
-        for path in paths {
-            let b = path.boundingBoxOfPath
-            bounds = bounds.isNull ? b : bounds.union(b)
-        }
-        if bounds.isNull {
-            return fallback
-        }
-        if fallback == defaultBox {
-            return bounds
-        }
-        return fallback
-    }
-
-    private func drawGrid(in context: GraphicsContext, viewBox: CGRect) {
-        guard gridSpacing > 0 else { return }
-        var path = Path()
-        let startX = floor(viewBox.minX / gridSpacing) * gridSpacing
-        let endX = ceil(viewBox.maxX / gridSpacing) * gridSpacing
-        let startY = floor(viewBox.minY / gridSpacing) * gridSpacing
-        let endY = ceil(viewBox.maxY / gridSpacing) * gridSpacing
-
-        var x = startX
-        while x <= endX {
-            path.move(to: CGPoint(x: x, y: viewBox.minY))
-            path.addLine(to: CGPoint(x: x, y: viewBox.maxY))
-            x += gridSpacing
-        }
-
-        var y = startY
-        while y <= endY {
-            path.move(to: CGPoint(x: viewBox.minX, y: y))
-            path.addLine(to: CGPoint(x: viewBox.maxX, y: y))
-            y += gridSpacing
-        }
-
-        context.stroke(path, with: .color(gridColor), lineWidth: 0.5)
-    }
-
-    private func drawBorder(in context: GraphicsContext, viewBox: CGRect) {
-        let rectPath = Path(viewBox)
-        context.stroke(rectPath, with: .color(borderColor), lineWidth: 1)
-    }
-}
-
-private extension Color {
-    init?(svg value: String) {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if trimmed.hasPrefix("#") {
-            self.init(hex: trimmed)
-            return
-        }
-        if trimmed.hasPrefix("rgb(") && trimmed.hasSuffix(")") {
-            let inner = trimmed.dropFirst(4).dropLast()
-            let parts = inner.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-            guard parts.count == 3,
-                  let r = Double(parts[0]), let g = Double(parts[1]), let b = Double(parts[2]) else { return nil }
-            self = Color(.sRGB, red: r / 255.0, green: g / 255.0, blue: b / 255.0, opacity: 1.0)
-            return
-        }
-        if let named = Color.named(trimmed) {
-            self = named
-            return
-        }
-        return nil
-    }
-
-    init?(hex: String) {
-        var value = hex.trimmingCharacters(in: .whitespacesAndNewlines)
-        if value.hasPrefix("#") {
-            value.removeFirst()
-        }
-        let length = value.count
-        guard length == 6 || length == 8 else { return nil }
-
-        var hexNumber: UInt64 = 0
-        let scanner = Scanner(string: value)
-        guard scanner.scanHexInt64(&hexNumber) else { return nil }
-
-        let r, g, b, a: Double
-        if length == 6 {
-            r = Double((hexNumber & 0xFF0000) >> 16) / 255.0
-            g = Double((hexNumber & 0x00FF00) >> 8) / 255.0
-            b = Double(hexNumber & 0x0000FF) / 255.0
-            a = 1.0
-        } else {
-            r = Double((hexNumber & 0xFF000000) >> 24) / 255.0
-            g = Double((hexNumber & 0x00FF0000) >> 16) / 255.0
-            b = Double((hexNumber & 0x0000FF00) >> 8) / 255.0
-            a = Double(hexNumber & 0x000000FF) / 255.0
-        }
-
-        self = Color(.sRGB, red: r, green: g, blue: b, opacity: a)
-    }
-
-    static func named(_ name: String) -> Color? {
-        switch name {
-        case "black": return .black
-        case "white": return .white
-        case "red": return .red
-        case "green": return .green
-        case "blue": return .blue
-        case "gray", "grey": return .gray
-        case "yellow": return .yellow
-        case "cyan": return .cyan
-        case "magenta": return Color(.sRGB, red: 1.0, green: 0.0, blue: 1.0, opacity: 1.0)
-        case "orange": return Color(.sRGB, red: 1.0, green: 0.55, blue: 0.0, opacity: 1.0)
-        default: return nil
-        }
+    /// Maps one rectangle onto another (scale + translation).
+    private func rectTransform(from source: CGRect, to target: CGRect) -> CGAffineTransform {
+        let sx = target.width / max(source.width, 0.0001)
+        let sy = target.height / max(source.height, 0.0001)
+        return CGAffineTransform(translationX: target.minX, y: target.minY)
+            .scaledBy(x: sx, y: sy)
+            .translatedBy(x: -source.minX, y: -source.minY)
     }
 }
 
 private enum DragMode {
-    case move(startPoint: CGPoint)
-    case resize(handle: Handle, startBounds: CGRect, startPoint: CGPoint)
+    /// The gesture hit nothing; it selects nothing and moves nothing.
+    case idle
+    case move(id: UUID, lastPoint: CGPoint)
+    case resize(id: UUID, handle: Handle, startBounds: CGRect, startPoint: CGPoint, currentBounds: CGRect)
 }
 
 private enum Handle: CaseIterable {
